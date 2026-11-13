@@ -1656,7 +1656,9 @@ class AssetLibrary:
     """PHASE 3 hook. Drop PNGs into ./assets and they replace the placeholder art automatically:
        <fighter>_<pose>.png (e.g. kai_idle.png, bronn_attack.png; drawn facing right) and bg_<stage>.png."""
     def __init__(self):
-        self.dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')
+        # when packaged as an .exe, look for the assets folder next to the .exe itself
+        base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+        self.dir = os.path.join(base, 'assets')
         self.cache = {}
 
     def get(self, name):
