@@ -4013,6 +4013,9 @@ def run_selftest(frames=3600):
     for scene in ('TITLE', 'ONLINE', 'PROFILES', 'MENU'):
         game.scene = scene
         game._render_frame()
+    art = {sp['name']: sum(len(v) for v in (game.assets.fighter(sp['name'].lower()) or {'frames': {}})['frames'].values())
+           for sp in ROSTER}
+    print("artwork images found:", art)
     print("SELFTEST OK")
 
 
