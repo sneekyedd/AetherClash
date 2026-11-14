@@ -26,11 +26,26 @@ python aether_clash.py
 | Heavy (smash) attack | K | `.` or Numpad 2 |
 | Special (costs Aether) | L | `/` or Numpad 3 |
 | Shield (tap just before a hit = parry) | Left Shift or I | Right Shift or Numpad Enter |
+| Grab | H | M or Numpad 4 |
 
 - Hold a direction while pressing Attack, Heavy or Special to get a different move (18 moves per fighter).
-- Shield + Attack = grab. Shield + left/right = roll. Shield in the air = air dodge.
+- After a grab: press a direction to throw that way, or Attack to pommel (small damage) first.
+- Down attacks have a small **spike spot**. Land it on an airborne rival and they are launched straight down.
+- Shield + left/right = roll. Shield in the air = air dodge.
 - Down = fast-fall, or drop through thin platforms. You grab ledges automatically; press Up to climb.
-- Esc pauses and shows the controls. F1 shows hitboxes. Gamepads are picked up automatically.
+- Esc pauses and shows the controls. F1 shows hitboxes (spike spots in magenta). Gamepads are picked up automatically.
+
+## Profiles
+
+**Profiles & Controls** on the start menu lets you create a profile: a player name plus, if you want, your own key
+bindings. Pick a profile on the character screen (Q / E for Player 1, [ / ] for Player 2). Profiles are saved in
+`aether_clash_profiles.json` next to the game.
+
+## Online
+
+The start menu has an **Online** entry, but online play is not implemented yet. The groundwork is there: a
+compact per-frame input format, a `NetworkDevice` controller, and `aether_server.py`, a small relay server that
+pairs two players (`python aether_server.py`).
 
 ## Fighters
 

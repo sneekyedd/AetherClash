@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+aether_clash_profiles.json
+icon.png
+build/
+dist/
+*.spec

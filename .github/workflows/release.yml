@@ -27,7 +27,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install pygame pyinstaller
+        run: pip install pygame pyinstaller pillow
 
       - name: Smoke test
         run: python aether_clash.py --selftest
@@ -35,8 +35,14 @@ jobs:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
 
+      - name: Draw the game icon
+        run: python aether_clash.py --make-icon icon.png
+        env:
+          SDL_VIDEODRIVER: dummy
+          SDL_AUDIODRIVER: dummy
+
       - name: Build AetherClash.exe
-        run: pyinstaller --onefile --windowed --name AetherClash aether_clash.py
+        run: pyinstaller --onefile --windowed --name AetherClash --icon icon.png aether_clash.py
 
       - name: Publish release
         shell: bash
