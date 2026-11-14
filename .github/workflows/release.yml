@@ -42,7 +42,7 @@ jobs:
           SDL_AUDIODRIVER: dummy
 
       - name: Build AetherClash.exe
-        run: pyinstaller --onefile --windowed --name AetherClash --icon icon.png aether_clash.py
+        run: pyinstaller --onefile --windowed --name AetherClash --icon icon.png --add-data "assets;assets" aether_clash.py
 
       - name: Publish release
         shell: bash

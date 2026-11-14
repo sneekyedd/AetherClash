@@ -2488,8 +2488,14 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
     return pygame.transform.smoothscale(s, (SPR, SPR))
 
 
-def quick_sprite(spec, col, key, facing, t, zoom=1.5):
+def quick_sprite(spec, col, key, facing, t, zoom=1.5, assets=None):
     """A fighter in a named pose with no blending, enlarged with crisp pixels (menus, result screen)."""
+    art = assets.frame(spec['name'].lower(), key, t, None, spec['stats']['h'] * 1.5, facing, zoom) if assets else None
+    if art:
+        surf = pygame.Surface((int(SPR * zoom), int(SPR * zoom)), pygame.SRCALPHA)
+        bob = math.sin(t * 0.07) * 1.5 * zoom if key == 'idle' else 0
+        surf.blit(art[0], (SPR_CX * zoom - art[1], SPR_FEET * zoom - art[2] - bob))
+        return surf
     spr = render_fighter_surface(spec, col, target_pose(spec, key, t), facing, t, key)
     small = pygame.transform.smoothscale(spr, (int(SPR * zoom / PIXEL), int(SPR * zoom / PIXEL)))
     return pygame.transform.scale(small, (int(SPR * zoom), int(SPR * zoom)))
@@ -2838,41 +2844,54 @@ def draw_projectile(surf, p, frame):
 SPRITE_POSES = ('idle', 'run', 'jump', 'fall', 'attack', 'hurt', 'stun', 'shield', 'parry', 'dodge', 'ledge',
                 'grab', 'grabbed', 'helpless', 'gun')
 # if a pose has no artwork, borrow the closest one that does (and finally 'idle')
-SPRITE_FALLBACK = dict(fall='jump', helpless='fall', parry='shield', grabbed='hurt', stun='hurt', gun='attack',
-                       grab='attack', dodge='run', ledge='jump', shield='idle', hurt='idle', jump='idle', run='idle',
-                       attack='idle')
+SPRITE_FALLBACK = dict(fall='jump', helpless='fall', parry='shield', grabbed='hurt', stun='hurt', gun='idle',
+                       dodge='run', ledge='jump', shield='idle', hurt='idle', jump='idle', run='idle', attack='idle')
 
 
 class AssetLibrary:
-    """Loads real artwork from the ./assets folder (next to the .exe when packaged). All of it is optional.
+    """Loads real artwork from an "assets" folder. All of it is optional; anything missing is drawn by code.
 
     Fighters:  assets/<fighter>/<pose>.png            one still image for a pose, or
                assets/<fighter>/<pose>_1.png, _2 ...  numbered frames, played as an animation
-               (poses: idle run jump fall attack hurt stun shield parry dodge ledge grab grabbed helpless;
-                draw the fighter facing right, on a transparent background, feet on the bottom edge)
-               assets/<fighter>/sprite.json           optional {"height": 130, "fps": 10}
+               Poses: idle run jump fall hurt stun shield parry dodge ledge grabbed helpless, plus one per move
+               (jab ftilt utilt dtilt dash fsmash usmash dsmash nair fair bair uair dair nspecial sspecial
+               uspecial dspecial grab). Draw the fighter facing right on a transparent background.
+               assets/<fighter>/sprite.json           optional {"scale": 0.8, "fps": 9,
+                                                       "anchors": {"jab": [body_centre_x, feet_y], ...},
+                                                       "zoom": {"idle": 0.85, ...}}  (per-image size tweak)
     Stages:    assets/bg_<stage>.png                  2400x1400 background (atoll, loom, crucible)
 
-    A fighter with any artwork is drawn entirely from it; missing poses borrow the nearest one."""
+    Folders are searched in this order: the AETHER_CLASH_ASSETS environment variable, an "assets" folder next
+    to the game (so players can swap art in), then the art packed inside the .exe."""
 
     def __init__(self):
-        self.dir = os.environ.get('AETHER_CLASH_ASSETS') or os.path.join(app_dir(), 'assets')
+        dirs = [os.environ.get('AETHER_CLASH_ASSETS'), os.path.join(app_dir(), 'assets'),
+                os.path.join(getattr(sys, '_MEIPASS', ''), 'assets') if getattr(sys, '_MEIPASS', None) else None,
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets')]
+        self.dirs = [d for i, d in enumerate(dirs) if d and d not in dirs[:i]]
         self.cache, self.sets, self.scaled = {}, {}, {}
 
     def get(self, name):
         if name not in self.cache:
-            path = os.path.join(self.dir, name + '.png')
-            try:
-                self.cache[name] = pygame.image.load(path).convert_alpha() if os.path.exists(path) else None
-            except pygame.error:
-                self.cache[name] = None
+            self.cache[name] = None
+            for d in self.dirs:
+                path = os.path.join(d, name + '.png')
+                if os.path.exists(path):
+                    try:
+                        self.cache[name] = pygame.image.load(path).convert_alpha()
+                        break
+                    except pygame.error:
+                        pass
         return self.cache[name]
 
     def fighter(self, name):
-        """Returns dict(frames={pose: [images]}, height=..., fps=...) or None if there is no art for this fighter."""
+        """Returns the fighter's art set (frames, anchors, scale, fps) or None if there is none."""
         if name not in self.sets:
-            folder, found, cfg = os.path.join(self.dir, name), [], {}
-            if os.path.isdir(folder):
+            found, cfg = [], {}
+            for d in self.dirs:
+                folder = os.path.join(d, name)
+                if not os.path.isdir(folder):
+                    continue
                 for fn in os.listdir(folder):
                     stem, ext = os.path.splitext(fn)
                     if ext.lower() != '.png':
@@ -2880,7 +2899,7 @@ class AssetLibrary:
                     pose, _, idx = stem.rpartition('_')
                     pose, idx = (pose, int(idx)) if (idx.isdigit() and pose) else (stem, 0)
                     try:
-                        found.append((pose.lower(), idx, pygame.image.load(os.path.join(folder, fn)).convert_alpha()))
+                        found.append((pose.lower(), idx, stem, pygame.image.load(os.path.join(folder, fn)).convert_alpha()))
                     except pygame.error:
                         pass
                 try:
@@ -2888,38 +2907,44 @@ class AssetLibrary:
                         cfg = json.load(fh)
                 except (OSError, ValueError):
                     pass
-            for pose in SPRITE_POSES:                         # older flat naming: assets/kai_idle.png
-                img = self.get(f"{name}_{pose}")
-                if img:
-                    found.append((pose, 0, img))
-            frames = {}
-            for pose, _, img in sorted(found, key=lambda f: (f[0], f[1])):
-                frames.setdefault(pose, []).append(img)
-            self.sets[name] = dict(frames=frames, height=cfg.get('height'), fps=cfg.get('fps', 10)) if frames else None
+                if found:
+                    break
+            frames, anchors = {}, cfg.get('anchors', {})
+            for pose, _, stem, img in sorted(found, key=lambda f: (f[0], f[1])):
+                a = anchors.get(stem) or [img.get_width() / 2, img.get_height()]
+                frames.setdefault(pose, []).append((img, a[0], a[1], cfg.get('zoom', {}).get(stem, 1.0)))
+            self.sets[name] = dict(frames=frames, scale=cfg.get('scale'), height=cfg.get('height'),
+                                   fps=cfg.get('fps', 10)) if frames else None
         return self.sets[name]
 
-    def frame(self, name, pose, tick, progress, target_height, facing):
-        """The image to show right now, scaled and flipped, or None."""
+    def has(self, name, pose):
+        art = self.fighter(name)
+        return bool(art and pose in art['frames'])
+
+    def frame(self, name, pose, tick, progress, target_height, facing, zoom=1.0):
+        """The image to show right now, scaled and flipped, with where the body centre and feet are in it.
+        Returns (image, anchor_x, anchor_y) or None."""
         art = self.fighter(name)
         if not art:
             return None
         frames, seen = art['frames'], set()
-        while pose not in frames and pose in SPRITE_FALLBACK and pose not in seen:
+        while pose not in frames and pose not in seen:        # borrow the nearest pose that has art
             seen.add(pose)
-            pose = SPRITE_FALLBACK[pose]
+            pose = SPRITE_FALLBACK.get(pose, 'idle')
         seq = frames.get(pose) or frames.get('idle') or next(iter(frames.values()))
-        if progress is not None:                              # attacks play once, in step with the move
+        if progress is not None:                              # plays once, in step with the move
             i = min(len(seq) - 1, int(progress * len(seq)))
         else:
             i = int(tick * art['fps'] / FPS) % len(seq)
-        ref = (frames.get('idle') or seq)[0]
-        k = (art['height'] or target_height) / ref.get_height()      # one scale for every frame of this fighter
-        key = (id(seq[i]), facing, round(k, 3))
+        img, ax, ay, own_zoom = seq[i]
+        ref = (frames.get('idle') or seq)[0][0]
+        k = (art['scale'] or (art['height'] or target_height) / ref.get_height()) * zoom * own_zoom
+        key = (id(img), facing, round(k, 3))
         if key not in self.scaled:
-            img = seq[i]
-            img = pygame.transform.smoothscale(img, (max(1, int(img.get_width() * k)), max(1, int(img.get_height() * k))))
-            self.scaled[key] = img if facing > 0 else pygame.transform.flip(img, True, False)
-        return self.scaled[key]
+            out = pygame.transform.smoothscale(img, (max(1, int(img.get_width() * k)), max(1, int(img.get_height() * k))))
+            self.scaled[key] = out if facing > 0 else pygame.transform.flip(out, True, False)
+        out = self.scaled[key]
+        return out, (ax * k if facing > 0 else out.get_width() - ax * k), ay * k
 
 
 # =====================================================================
@@ -2931,6 +2956,7 @@ class StateTranslator:
 
     def __init__(self, assets):
         self.assets = assets
+        self.roster = []
 
     def _attack_info(self, c):
         """Works out how the current move should be animated: which limb, aimed where, in which phase."""
@@ -3005,18 +3031,70 @@ class StateTranslator:
         target = target_pose(c.spec, key, c.anim, info)
         rate = 0.8 if info.get('phase') == 'strike' else 0.42
         c.pose = target if c.pose is None else blend_pose(c.pose, target, rate)
-        progress = c.move_frame / max(1, c.current_move.duration) if (key == 'attack' and c.current_move) else None
-        img = self.assets.frame(c.name.lower(), key, c.anim, progress, c.h * 1.5, c.facing)
-        if img:                                              # real artwork, if this fighter has any
-            surf = pygame.Surface((SPR, SPR), pygame.SRCALPHA)
-            surf.blit(img, (SPR_CX - img.get_width() // 2, SPR_FEET - img.get_height()))
-            return surf
+        name = c.name.lower()
+        if self.assets.fighter(name):                        # this fighter has real artwork
+            return self._art_sprite(c, name, key)
         vel = ((c.vx + c.kbx) * c.facing, c.vy + c.kby)
         if c.cloth is None:
             c.cloth = ClothSim()
         return render_fighter_surface(c.spec, c.colors, c.pose, c.facing, c.anim, key, vel, info, c.cloth, (c.x, c.y))
 
+    def art_window(self, c):
+        """True while a move's own artwork (which has its effect painted in) should be on screen."""
+        m, f = c.current_move, c.move_frame
+        boxes = [b for b in m.hitbox_data if not b['spike']] or m.hitbox_data
+        if m is DEATH_RAY:
+            return False
+        if boxes:
+            return min(b['start'] for b in boxes) - 3 <= f <= max(b['end'] for b in boxes) + 8
+        if m.projectile:
+            return m.projectile['frame'] - 8 <= f <= m.projectile['frame'] + 3
+        return True
+
+    def _art_sprite(self, c, name, key):
+        """Builds this frame's sprite from the fighter's artwork. Poses with no art of their own are
+        brought to life by tilting, bobbing and stretching the nearest pose."""
+        pose, tilt, bob = key, 0.0, 0.0
+        if key == 'attack' and c.current_move:
+            m = c.current_move
+            if self.art_window(c) and self.assets.has(name, m.slot):
+                pose = m.slot
+            else:
+                pose = 'idle' if c.ground else 'fall'
+                early = m.hitbox_data and c.move_frame < min(b['start'] for b in m.hitbox_data)
+                tilt = 8.0 if early else -3.0                 # lean back to wind up, settle afterwards
+        elif key == 'gun':
+            pose = 'idle'
+        if not self.assets.has(name, pose) and pose in ('run', 'jump', 'fall', 'dodge', 'helpless', 'stun', 'grabbed'):
+            if pose == 'run':
+                tilt, bob = -7.0, abs(math.sin(c.anim * 0.36)) * 5
+            elif pose in ('jump', 'dodge'):
+                tilt = -6.0
+            elif pose in ('fall', 'helpless'):
+                tilt = 6.0
+            elif pose == 'stun':
+                tilt = math.sin(c.anim * 0.12) * 9
+            else:
+                tilt = 10.0
+        if pose in ('idle', 'shield') or (pose == 'run' and bob):
+            bob += math.sin(c.anim * 0.07) * 1.2               # breathing
+        img, ax, ay = self.assets.frame(name, pose, c.anim, None, c.h * 1.5, c.facing)
+        if c.slot == 1 and len({o.name for o in self.roster}) == 1:      # mirror match: player 2 gets a cool tint
+            img = img.copy()
+            img.fill((170, 190, 255, 255), special_flags=pygame.BLEND_RGBA_MULT)
+        surf = pygame.Surface((SPR, SPR), pygame.SRCALPHA)
+        if tilt:
+            rot = pygame.transform.rotate(img, tilt * c.facing)
+            dx, dy = ax - img.get_width() / 2, ay - img.get_height() / 2      # keep the feet planted while leaning
+            a = math.radians(-tilt * c.facing)
+            rx, ry = dx * math.cos(a) - dy * math.sin(a), dx * math.sin(a) + dy * math.cos(a)
+            surf.blit(rot, (SPR_CX - rot.get_width() / 2 - rx, SPR_FEET - rot.get_height() / 2 - ry - bob))
+        else:
+            surf.blit(img, (SPR_CX - ax, SPR_FEET - ay - bob))
+        return surf
+
     def update_visuals(self, surface, characters, physics, show_boxes=False):
+        self.roster = list(characters.values())
         for c in characters.values():
             if c.current_state == "KO":
                 continue
@@ -3033,13 +3111,14 @@ class StateTranslator:
                         spr.fill((int(255 - 255 * k),) * 3 + (255,), special_flags=pygame.BLEND_RGBA_MULT)
                     else:
                         spr.fill((int(r * k), int(g * k), int(b * k), 0), special_flags=pygame.BLEND_RGBA_ADD)
-                if v['outline']:
+                has_art = self.assets.fighter(c.name.lower()) is not None
+                if v['outline'] and not (has_art and c.current_state == "ATTACKING" and not (c.current_move and c.current_move.counter)):
                     pts = pygame.mask.from_surface(spr, 200).outline(3)
                     if len(pts) > 2:
                         pygame.draw.lines(spr, v['outline'], True, pts, 2)
                 if v['alpha'] < 255:
                     spr.set_alpha(v['alpha'])
-                rotation = v['rotation'] or c.pose.get('spin', 0)
+                rotation = v['rotation'] or (0 if self.assets.fighter(c.name.lower()) else c.pose.get('spin', 0))
                 if rotation:
                     pivot = pygame.Surface((SPR, SPR), pygame.SRCALPHA)      # rotate around the body centre
                     pivot.blit(spr, (0, SPR // 2 - (SPR_FEET - c.h // 2)))
@@ -3063,7 +3142,7 @@ class StateTranslator:
                     if box['spike']:                            # a small glint marks the spike spot
                         pygame.draw.lines(surface, (255, 160, 255), False,
                                           [(r.left, r.centery - 5), (r.centerx, r.bottom), (r.right, r.centery - 5)], 3)
-                    else:
+                    elif not (self.assets.has(c.name.lower(), c.current_move.slot) and self.art_window(c)):
                         draw_attack_fx(surface, c, box, r, physics.frame)
             cx, cy = c.center
             if c.current_state == "SHIELD":
@@ -3737,7 +3816,7 @@ class GameManager:
         scr, t = self.screen, self.frame
         for i, spec in enumerate(ROSTER):                            # the cast idles along the bottom
             x = (110, 310, 970, 1170)[i]
-            spr = quick_sprite(spec, spec['colors'], 'idle', 1 if i < 2 else -1, t + i * 37)
+            spr = quick_sprite(spec, spec['colors'], 'idle', 1 if i < 2 else -1, t + i * 37, assets=self.assets)
             scr.blit(spr, (x - SPR_CX * 3 // 2, 620 - SPR_FEET * 3 // 2))
             self.text(scr, spec['name'].upper(), 26, spec['colors']['accent'], (x, 644))
         scr.blit(self.logo, self.logo.get_rect(center=(SCREEN_WIDTH // 2, 110)))
@@ -3844,7 +3923,7 @@ class GameManager:
             who = ("CPU - Hard" if self.p1_cpu else "Human") if slot == 0 else self.P2_MODES[self.p2_mode]
             self.text(scr, f"PLAYER {slot + 1}  -  {who}", 26, PLAYER_TAGS[slot], (card.x + 18, card.y + 12), 'topleft')
             pose = 'run' if (t // 180) % 2 else 'idle'
-            spr = quick_sprite(spec, col, pose, 1 if slot == 0 else -1, t)
+            spr = quick_sprite(spec, col, pose, 1 if slot == 0 else -1, t, assets=self.assets)
             scr.blit(spr, (card.x + 110 - SPR_CX * 3 // 2, card.y + 238 - SPR_FEET * 3 // 2))
             tx = card.x + 210
             self.text(scr, f"<  {spec['name'].upper()}  >", 46, WHITE, (tx, card.y + 46), 'topleft')
@@ -3894,7 +3973,7 @@ class GameManager:
         scr.blit(dim, (0, 0))
         w = self.winner
         if w:
-            spr = quick_sprite(w.spec, w.colors, 'parry', 1, self.frame, 2)
+            spr = quick_sprite(w.spec, w.colors, 'idle', 1, self.frame, 2, assets=self.assets)
             scr.blit(spr, (SCREEN_WIDTH // 2 - SPR_CX * 2, 640 - SPR_FEET * 2))
             self.text(scr, f"{w.player_name} WINS!", 110, w.colors['accent'], (SCREEN_WIDTH // 2, 100))
             self.text(scr, f"{w.name}, {w.spec['title']}  -  {w.current_lives} lives left", 30, WHITE, (SCREEN_WIDTH // 2, 170))

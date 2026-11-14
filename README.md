@@ -62,16 +62,16 @@ pairs two players (`python aether_server.py`).
 - Aether: gained by dealing and taking damage, slowly over time, and **+25 for a parry**. Specials spend it.
 - Everything is simulated in fixed 1/60 s frames, so move timings ("frame data") are exact and repeatable.
 
-## Custom art
+## Artwork
 
-Real artwork replaces the code-drawn fighters automatically. Put PNGs in an `assets` folder next to the game:
+The fighters are drawn from the sprite images in `assets/<fighter>/`: one image per move (`jab.png`, `fsmash.png`,
+...) plus movement poses (`idle`, `run_1`, `run_2`, ..., `jump`, `fall`, `hurt`, `shield`, ...). These are packed
+into the `.exe`. Any fighter or pose without an image falls back to the nearest pose, or to the code-drawn fighter.
 
-- `assets/kai/idle.png` for a single still image of a pose, or `assets/kai/run_1.png`, `run_2.png`, ... for an
-  animation (frames play in number order).
-- Poses: `idle`, `run`, `jump`, `fall`, `attack`, `hurt`, `stun`, `shield`, `parry`, `dodge`, `ledge`, `grab`,
-  `grabbed`, `helpless`. Missing poses borrow the nearest one, so `idle` alone is enough to start.
-- Draw the fighter facing right on a transparent background, with the feet touching the bottom edge and every
-  frame the same size.
-- Optional `assets/kai/sprite.json`: `{"height": 130, "fps": 10}` sets the on-screen height in pixels and the
-  animation speed.
+To change the art, put an `assets` folder next to the game; it takes priority over the built-in images.
+
+- A still pose is `assets/kai/idle.png`; an animation is `run_1.png`, `run_2.png`, ... played in number order.
+- Draw the fighter facing right on a transparent background.
+- `assets/kai/sprite.json` holds the size and alignment: `scale`, `fps`, `anchors` (where the body centre and feet
+  are in each image, so effects painted into a move do not shift the fighter) and `zoom` (per-image size tweak).
 - Stage backgrounds: `assets/bg_atoll.png`, `bg_loom.png`, `bg_crucible.png` (2400x1400).
