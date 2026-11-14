@@ -178,6 +178,8 @@ class CharacterData:
         self.grab_target = self.grabbed_by = None
         self.grab_timer = self.grab_frames = self.pommel_cd = self.pommel_anim = 0
         self.pose = None                  # smoothed skeleton pose (owned by the StateTranslator)
+        self.cloth = None                 # rope physics for scarves, hair and flames
+        self.squash = 0.0                 # >0 stretched tall (jumping), <0 squashed flat (landing)
 
     @property
     def is_cryptic(self):
@@ -430,8 +432,8 @@ ROSTER = [
          stats=dict(speed=7.0, air_speed=5.4, jump_height=15, double_jump=13.5, gravity=0.72, max_fall=13,
                     weight=104, w=52, h=84),
          bars=(4, 4, 3, 1), ai=dict(mid=['sspecial', 'dspecial'], close=['nspecial']),
-         colors=dict(main=(235, 120, 40), dark=(120, 48, 20), accent=(255, 224, 90), skin=(232, 180, 140)),
-         alt=dict(main=(70, 74, 92), dark=(30, 32, 44), accent=(96, 206, 255), skin=(232, 180, 140))),
+         colors=dict(main=(235, 120, 40), dark=(120, 48, 20), accent=(255, 224, 90), skin=(232, 180, 140), flame=(240, 88, 22)),
+         alt=dict(main=(70, 74, 92), dark=(30, 32, 44), accent=(96, 206, 255), skin=(232, 180, 140), flame=(40, 96, 230))),
 ]
 # The secret super move: a comically large gun that blasts the whole screen. Cannot be shielded.
 DEATH_RAY = S("Death Ray", 130, 0, hb(56, 60, 0, 0, 8000, 6000, 40, 21, 45, radial=True, unblockable=True),
@@ -699,6 +701,7 @@ class PhysicsEngine:
                 break
 
     def _land(self, c, p):
+        c.squash = -min(0.24, 0.06 + abs(c.vy) * 0.014)       # squash on landing, harder after a long fall
         c.y, c.vy, c.ground = p.y, 0.0, p
         c.kby = 0.0
         c.jumps_left = c.air_jumps
@@ -1143,6 +1146,10 @@ class CombatManager:
             if c.frozen:
                 continue
             c.aether_gauge = min(AETHER_MAX, c.aether_gauge + AETHER_PASSIVE)
+            c.squash *= 0.8
+            if c.spec.get('style') == 'kindled' and c.anim % 9 == 0:        # her hair sheds the odd ember
+                self.fx.spark(c.x - c.facing * 6, c.y - c.h - 14, c.colors['accent'], 1, 1.6, 44, 3, grav=-0.07,
+                              direction=-math.pi / 2, spread=0.9)
             for attr in ('intangible', 'lag', 'ledge_cd', 'drop_timer', 'buff_timer', 'flash', 'shield_stun',
                          'pommel_cd', 'pommel_anim'):
                 v = getattr(c, attr)
@@ -1383,6 +1390,7 @@ class CharacterController:
         else:
             return
         c.ground, c.fast_fall = None, False
+        c.squash = 0.2                                   # stretch upward as they leave the ground
         c.current_state = "JUMPING"
 
     def _dodge(self, x, y, air=False):
@@ -1859,29 +1867,86 @@ def blend_pose(cur, tgt, rate):
     return out
 
 
-def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), info=None):
-    """Draws a fighter from a skeleton pose onto a transparent surface (feet at SPR_CX, SPR_FEET)."""
+class ClothSim:
+    """Rope physics (Verlet integration) for scarves, hair, plumes, hems and flames.
+    Each strand is a chain of points simulated in world space, so it lags behind when the fighter
+    moves, whips round when they turn, and settles when they stop."""
+
+    def __init__(self):
+        self.chains, self.ox, self.oy, self.f = {}, 0.0, 0.0, 1
+
+    def begin(self, ox, oy, facing):
+        self.ox, self.oy, self.f = ox, oy, facing
+
+    def chain(self, name, anchor, n, seg, gravity=0.5, damp=0.86, wave=0.25, t=0.0, breeze=0.12):
+        ax, ay = self.ox + anchor[0] * self.f, self.oy + anchor[1]
+        pts = self.chains.get(name)
+        if pts is None or len(pts) != n + 1 or abs(pts[0][0] - ax) + abs(pts[0][1] - ay) > 160:
+            d = 1 if gravity >= 0 else -1                     # (re)start hanging down, or rising for flames
+            pts = [[ax - self.f * i * seg * 0.3, ay + d * i * seg * 0.95] * 2 for i in range(n + 1)]
+            self.chains[name] = pts
+        pts[0][0], pts[0][1] = ax, ay
+        phase = len(name) * 1.7
+        for i in range(1, n + 1):
+            p = pts[i]
+            vx, vy = (p[0] - p[2]) * damp, (p[1] - p[3]) * damp
+            p[2], p[3] = p[0], p[1]
+            p[0] += vx + math.sin(t * 0.21 + i * 1.1 + phase) * wave - self.f * breeze   # a breeze from the front
+            p[1] += vy + gravity
+        for _ in range(2):                                    # keep every link at its length
+            for i in range(1, n + 1):
+                a, b = pts[i - 1], pts[i]
+                dx, dy = b[0] - a[0], b[1] - a[1]
+                d = math.hypot(dx, dy) or 0.001
+                b[0], b[1] = a[0] + dx / d * seg, a[1] + dy / d * seg
+        return [((p[0] - self.ox) * self.f, p[1] - self.oy) for p in pts]
+
+
+SS = 2          # fighters are drawn at double size and scaled down, which smooths every edge
+                # (the Game Manager drops this to 1 on computers that cannot hold 60 FPS)
+
+
+def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), info=None, cloth=None, origin=(0, 0)):
+    """Draws a fighter from a skeleton pose onto a transparent surface (feet at SPR_CX, SPR_FEET).
+    cloth: the fighter's ClothSim. Without one (menus) the flowing parts use a simple wave instead."""
     info = info or {}
-    s = pygame.Surface((SPR, SPR), pygame.SRCALPHA)
+    s = pygame.Surface((SPR * SS, SPR * SS), pygame.SRCALPHA)
     D = pygame.draw
     st = spec['stats']
     w, h, style, f = st['w'], st['h'], spec['style'], facing
     main, dark, acc, skin = col['main'], col['dark'], col['accent'], col['skin']
     mid, light = lerp_color(main, dark, 0.5), lerp_color(main, WHITE, 0.35)
+    ink = (36, 20, 34)
     floaty = style == 'voidcaller' and key not in ('ledge', 'grabbed')
     yo = -(8 + math.sin(t * 0.07) * 3) if floaty else 0
+    if cloth:
+        cloth.begin(origin[0], origin[1] + yo, f)
 
-    def M(p):                                                # local -> surface pixels
-        return (SPR_CX + p[0] * f, SPR_FEET + p[1] + yo)
+    def M(p):                                                # local -> (supersampled) surface pixels
+        return ((SPR_CX + p[0] * f) * SS, (SPR_FEET + p[1] + yo) * SS)
 
     def C(color, p, r, width=0):
-        D.circle(s, color, (int(SPR_CX + p[0] * f), int(SPR_FEET + p[1] + yo)), max(1, int(r)), width)
+        x, y = M(p)
+        D.circle(s, color, (int(x), int(y)), max(1, int(r * SS)), int(width * SS))
 
     def poly(color, pts, width=0):
-        D.polygon(s, color, [M(p) for p in pts], width)
+        D.polygon(s, color, [M(p) for p in pts], int(width * SS))
 
     def line(color, a, b, width):
-        D.line(s, color, M(a), M(b), max(1, int(width)))
+        D.line(s, color, M(a), M(b), max(1, int(width * SS)))
+
+    def box(color, center, bw, bh, radius=0, width=0):
+        r = pygame.Rect(0, 0, int(bw * SS), int(bh * SS))
+        r.center = M(center)
+        D.rect(s, color, r, int(width * SS), border_radius=int(radius * SS))
+
+    def oval(color, center, bw, bh, width=0):
+        r = pygame.Rect(0, 0, int(bw * SS), int(bh * SS))
+        r.center = M(center)
+        D.ellipse(s, color, r, int(width * SS))
+
+    def halo(color, p, radius, alpha):
+        glow(s, color, M(p), radius * SS, min(190, alpha))    # stays under the outline threshold
 
     hr = max(13, w * 0.33)
     hip, sh = P['hip'], P['sh']
@@ -1894,31 +1959,55 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
     ef, hf = ik(sf, P['hf'], arm, arm, 1)
     eb, hb_ = ik(sb, P['hb'], arm, arm, 1)
     head = (sh[0] + (sh[0] - hip[0]) * 0.25 + P['head'][0], sh[1] - hr * 0.92 + P['head'][1])
-    # cloth, hair and flames stream out behind the direction of travel
-    tvx, tvy = -vel[0] * 1.3 - 5, -vel[1] * 0.9 + 2
+    blink = int(t) % 190 < 7
+    pained = key in ('hurt', 'stun', 'grabbed')
+    striking = key == 'attack' and info.get('phase') == 'strike'
+    tvx, tvy = -vel[0] * 1.3 - 5, -vel[1] * 0.9 + 2          # fallback flow direction when there is no ClothSim
     tn = math.hypot(tvx, tvy) or 1
     tdx, tdy = tvx / tn, tvy / tn
     flow = min(1.6, 0.6 + tn / 14)
 
-    def chain(anchor, n, seg, amp, droop=0.5):
-        pts = [anchor]
+    def chain(name, anchor, n, seg, gravity=0.5, damp=0.86, wave=0.25, breeze=0.12):
+        if cloth:
+            return cloth.chain(name, anchor, n, seg, gravity, damp, wave, t, breeze)
+        pts, ph = [anchor], len(name) * 1.7
         for i in range(1, n + 1):
-            wv = math.sin(t * 0.22 + i * 0.9) * amp * i / n
-            pts.append((anchor[0] + tdx * seg * i * flow - tdy * wv,
-                        anchor[1] + tdy * seg * i * flow + tdx * wv + droop * i * i * 0.35))
+            wv = math.sin(t * 0.22 + i * 0.9 + ph) * (2 + wave * 6) * i / n
+            if gravity < 0:                                  # flames lick upward
+                pts.append((anchor[0] + tdx * seg * i * 0.35 + wv, anchor[1] - seg * i * 0.95))
+            else:
+                pts.append((anchor[0] + tdx * seg * i * flow - tdy * wv,
+                            anchor[1] + tdy * seg * i * flow + tdx * wv + i * i * 0.3))
         return pts
 
-    def ribbon(pts, color, w0, w1=2):
-        for i in range(len(pts) - 1):
-            line(color, pts[i], pts[i + 1], w0 + (w1 - w0) * i / (len(pts) - 1))
-            C(color, pts[i + 1], (w0 + (w1 - w0) * i / (len(pts) - 1)) / 2)
+    def ribbon(pts, color, w0, w1=1.5, profile=None):
+        """A smooth tapering strip along a chain of points."""
+        n = len(pts)
+        left, right = [], []
+        for i, p in enumerate(pts):
+            a, b = pts[max(0, i - 1)], pts[min(n - 1, i + 1)]
+            dx, dy = b[0] - a[0], b[1] - a[1]
+            d = math.hypot(dx, dy) or 1
+            u = i / (n - 1)
+            wd = (profile(u) if profile else w0 + (w1 - w0) * u) / 2
+            left.append((p[0] - dy / d * wd, p[1] + dx / d * wd))
+            right.append((p[0] + dy / d * wd, p[1] - dx / d * wd))
+        poly(color, left + right[::-1])
+        C(color, pts[0], (profile(0) if profile else w0) / 2)
+
+    def flame_strand(pts, width, colors, seed=0.0):
+        """A tongue of fire along a chain: fat near the base, flickering, tapering to a point."""
+        for k, color in zip((1.0, 0.64, 0.32), colors):
+            cut = pts[:max(3, int(len(pts) * (0.55 + 0.45 * k)))]
+            ribbon(cut, color, 0, profile=lambda u, k=k: 2.2 * k + width * k * (0.5 + 0.5 * math.sin(math.pi * min(1.0, u * 2.6 + 0.2)))
+                   * (1 - u) ** 0.6 * (0.82 + 0.18 * math.sin(t * 0.7 + u * 8 + seed)))
 
     def limb(color, a, j, b, width, color2=None, width2=None):
         c2, w2 = color2 or color, width2 or width
         line(color, a, j, width)
         line(c2, j, b, w2)
         C(color, a, width / 2)
-        C(color, j, width / 2)
+        C(color, j, max(width, w2) / 2)
         C(c2, b, w2 / 2)
 
     tw, hw = w * 0.56, w * 0.44
@@ -1926,63 +2015,106 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
     def torso(color, tw_, hw_, drop=4):
         poly(color, [(sh[0] - tw_ / 2, sh[1]), (sh[0] + tw_ / 2, sh[1]),
                      (hip[0] + hw_ / 2, hip[1] + drop), (hip[0] - hw_ / 2, hip[1] + drop)])
+        C(color, (sh[0] - tw_ / 2 + 3, sh[1] + 2), 3.5)       # rounded shoulders
+        C(color, (sh[0] + tw_ / 2 - 3, sh[1] + 2), 3.5)
+
+    def human_eye(p, r):
+        if pained:                                           # squeezed shut: ">"
+            line(ink, (p[0] - r, p[1] - r), (p[0] + r * 0.6, p[1]), 1.5)
+            line(ink, (p[0] - r, p[1] + r), (p[0] + r * 0.6, p[1]), 1.5)
+        elif blink:
+            line(ink, (p[0] - r, p[1]), (p[0] + r, p[1]), 1.5)
+        else:
+            oval(WHITE, p, r * 2.3, r * 2.1)
+            C(ink, (p[0] + r * 0.35, p[1] + 0.3), r * 0.72)
+            C(WHITE, (p[0] + r * 0.6, p[1] - r * 0.35), r * 0.25)
 
     if style == 'weaver':
         # ---------------- KAI: slim duelist, thread-blade, twin scarf tails
-        limb(mid, sb, eb, hb_, aw, skin)
+        neck = (sh[0] - 3, sh[1] + 1)
+        limb(mid, sb, eb, hb_, aw, lerp_color(skin, dark, 0.2))
         limb(dark, hpb, kb, fb, lw)
-        ribbon(chain((sh[0] - 4, sh[1] + 2), 7, 9, 5), lerp_color(acc, WHITE, 0.45), 6)
-        ribbon(chain((sh[0] - 4, sh[1] + 5), 6, 9, 6, 0.7), acc, 7)
+        ribbon(chain('scarf2', (neck[0], neck[1] + 3), 8, 8, 0.2, 0.9, 0.6, 0.5), lerp_color(acc, dark, 0.3), 8, 2)
+        ribbon(chain('scarf1', neck, 9, 8, 0.16, 0.9, 0.6, 0.55), acc, 9, 2)
         torso(main, tw, hw)
+        poly(mid, [(sh[0] - tw / 2, sh[1]), (sh[0] - tw * 0.1, sh[1]), (hip[0] - hw * 0.2, hip[1] + 4),
+                   (hip[0] - hw / 2, hip[1] + 4)])                                           # shaded back half
         line(acc, (sh[0] + tw * 0.2, sh[1] + 1), (hip[0] + hw * 0.15, hip[1] + 3), 2)        # tunic trim
-        line(light, (sh[0] - tw * 0.3, sh[1] + 2), (sh[0] + tw * 0.4, sh[1] + 2), 3)         # collar
+        for i in range(3):                                                                    # toggles
+            ty_ = sh[1] + 6 + i * 6
+            line(light, (sh[0] + tw * 0.12, ty_), (sh[0] + tw * 0.3, ty_), 1.5)
         line(dark, (hip[0] - hw / 2, hip[1]), (hip[0] + hw / 2, hip[1]), 6)                  # sash
-        C(acc, (hip[0] + hw * 0.3, hip[1]), 4)
-        ribbon(chain((hip[0] - hw * 0.3, hip[1] + 2), 3, 7, 3, 1.2), dark, 4)
-        limb(dark, hpf, kf, ff, lw)
+        C(acc, (hip[0] + hw * 0.3, hip[1]), 3.5)
+        ribbon(chain('sash', (hip[0] - hw * 0.3, hip[1] + 2), 4, 6, 0.5, 0.86, 0.3), dark, 5, 2)
+        limb(lerp_color(dark, main, 0.15), hpf, kf, ff, lw)
         for foot in (fb, ff):                                                                # boots + gold cuffs
-            C(mid, (foot[0] + 3, foot[1] - 4), lw / 2 + 2)
-            C(acc, (foot[0], foot[1] - 10), 3)
+            oval(mid, (foot[0] + 3, foot[1] - 4), lw + 8, lw + 2)
+            line(acc, (foot[0] - 4, foot[1] - 10), (foot[0] + 4, foot[1] - 10), 2.5)
+        ribbon(chain('tail', (head[0] - hr * 0.85, head[1] - hr * 0.25), 5, 6, 0.26, 0.88, 0.4, 0.3), dark, 8, 2)
         C(skin, head, hr)
-        poly(dark, [(head[0] + hr * 0.9, head[1] - hr * 0.2), (head[0] + hr * 0.3, head[1] - hr * 1.25),
-                    (head[0] - hr * 0.6, head[1] - hr * 1.1), (head[0] - hr * 1.1, head[1] - hr * 0.3),
-                    (head[0] - hr * 0.8, head[1] + hr * 0.35), (head[0] - hr * 0.2, head[1] - hr * 0.35)])
-        ribbon(chain((head[0] - hr * 0.9, head[1] - hr * 0.2), 4, 7, 4, 0.8), dark, 7, 2)    # ponytail
-        line(acc, (head[0] - hr * 0.95, head[1] - hr * 0.3), (head[0] + hr * 0.95, head[1] - hr * 0.42), 3)
-        line((30, 16, 30), (head[0] + hr * 0.3, head[1]), (head[0] + hr * 0.72, head[1] - 2), 3)
+        poly(dark, [(head[0] + hr * 0.95, head[1] - hr * 0.25), (head[0] + hr * 0.45, head[1] - hr * 1.3),
+                    (head[0] - hr * 0.5, head[1] - hr * 1.18), (head[0] - hr * 1.15, head[1] - hr * 0.35),
+                    (head[0] - hr * 0.85, head[1] + hr * 0.4), (head[0] - hr * 0.25, head[1] - hr * 0.3)])
+        poly(dark, [(head[0] + hr * 0.2, head[1] - hr * 0.95), (head[0] + hr * 1.15, head[1] - hr * 0.75),
+                    (head[0] + hr * 0.6, head[1] - hr * 0.35)])                              # fringe
+        line(acc, (head[0] - hr * 0.98, head[1] - hr * 0.32), (head[0] + hr * 0.98, head[1] - hr * 0.44), 3)
+        human_eye((head[0] + hr * 0.48, head[1] + hr * 0.08), hr * 0.2)
+        if not pained:
+            line(ink, (head[0] + hr * 0.2, head[1] - hr * 0.22), (head[0] + hr * 0.8, head[1] - hr * 0.1), 1.5)
+        if striking or pained:
+            C(ink, (head[0] + hr * 0.5, head[1] + hr * 0.55), 1.8)                           # open mouth
+        else:
+            line(ink, (head[0] + hr * 0.35, head[1] + hr * 0.55), (head[0] + hr * 0.65, head[1] + hr * 0.5), 1)
         limb(main, sf, ef, hf, aw, skin)
-        C(acc, ((ef[0] + hf[0]) / 2, (ef[1] + hf[1]) / 2), 3)                                # arm wrap
+        for k in (0.35, 0.6):                                                                # arm wraps
+            line(acc, (ef[0] + (hf[0] - ef[0]) * k - 3, ef[1] + (hf[1] - ef[1]) * k),
+                 (ef[0] + (hf[0] - ef[0]) * k + 3, ef[1] + (hf[1] - ef[1]) * k), 2)
         bx, by = math.cos(P['wp']), math.sin(P['wp'])
-        tip = (hf[0] + bx * 50, hf[1] + by * 50)
-        ribbon(chain((hf[0] - bx * 8, hf[1] - by * 8), 4, 7, 5, 0.3), acc, 2, 1)             # thread on the pommel
-        line((120, 220, 255), hf, tip, 6)
-        line(WHITE, hf, tip, 3)
-        line(acc, (hf[0] + bx * 5 - by * 7, hf[1] + by * 5 + bx * 7),
-             (hf[0] + bx * 5 + by * 7, hf[1] + by * 5 - bx * 7), 3)
-        C(skin, hf, 5)
+        tip = (hf[0] + bx * 52, hf[1] + by * 52)
+        ribbon(chain('thread', (hf[0] - bx * 8, hf[1] - by * 8), 6, 6, 0.25, 0.9, 0.5), acc, 1.5, 1)
+        poly((110, 210, 250), [(hf[0] - by * 3.2, hf[1] + bx * 3.2), (hf[0] + by * 3.2, hf[1] - bx * 3.2), tip])
+        poly(WHITE, [(hf[0] - by * 1.3, hf[1] + bx * 1.3), (hf[0] + by * 1.3, hf[1] - bx * 1.3),
+                     (hf[0] + bx * 46, hf[1] + by * 46)])
+        C(WHITE, (hf[0] + bx * (20 + 14 * math.sin(t * 0.09)), hf[1] + by * (20 + 14 * math.sin(t * 0.09))), 1.6)   # glint
+        line(acc, (hf[0] + bx * 4 - by * 7, hf[1] + by * 4 + bx * 7), (hf[0] + bx * 4 + by * 7, hf[1] + by * 4 - bx * 7), 3)
+        C(acc, (hf[0] - bx * 6, hf[1] - by * 6), 2.5, 1)                                     # needle's eye
+        C(skin, hf, 4.5)
 
     elif style == 'sentinel':
         # ---------------- BRONN: plated guardian, kite shield + stone maul
         weapon = info.get('weapon', 'shield')
+        power = 60 if striking else 0                        # runes flare when he strikes
+        steel = lerp_color(skin, WHITE, 0.25)
 
         def maul(hand, a):
             bx, by = math.cos(a), math.sin(a)
             end = (hand[0] + bx * 46, hand[1] + by * 46)
-            line((92, 72, 60), (hand[0] - bx * 10, hand[1] - by * 10), end, 5)
-            poly(skin, [(end[0] + bx * 11 - by * 17, end[1] + by * 11 + bx * 17),
-                        (end[0] + bx * 11 + by * 17, end[1] + by * 11 - bx * 17),
-                        (end[0] - bx * 11 + by * 17, end[1] - by * 11 - bx * 17),
-                        (end[0] - bx * 11 - by * 17, end[1] - by * 11 + bx * 17)])
-            line(acc, (end[0] - by * 12, end[1] + bx * 12), (end[0] + by * 12, end[1] - bx * 12), 3)
+            line((70, 54, 46), (hand[0] - bx * 12, hand[1] - by * 12), end, 5.5)
+            line((120, 96, 78), (hand[0] - bx * 12, hand[1] - by * 12), end, 2)
+            for k in (-4, 4, 12):                                                             # grip wraps
+                line(acc, (hand[0] + bx * k - by * 3, hand[1] + by * k + bx * 3),
+                     (hand[0] + bx * k + by * 3, hand[1] + by * k - bx * 3), 1.5)
+            blk = [(end[0] + bx * 11 - by * 17, end[1] + by * 11 + bx * 17), (end[0] + bx * 11 + by * 17, end[1] + by * 11 - bx * 17),
+                   (end[0] - bx * 11 + by * 17, end[1] - by * 11 - bx * 17), (end[0] - bx * 11 - by * 17, end[1] - by * 11 + bx * 17)]
+            poly(skin, blk)
+            poly(steel, [blk[0], blk[1], (end[0] + bx * 5 + by * 17, end[1] + by * 5 - bx * 17),
+                         (end[0] + bx * 5 - by * 17, end[1] + by * 5 + bx * 17)])
+            poly(dark, blk, 2)
+            halo(acc, end, 9 + power * 0.1, 90 + power)
+            line(acc, (end[0] - by * 11, end[1] + bx * 11), (end[0] + by * 11, end[1] - bx * 11), 2.5)
 
         def shield(hand, fill):
             cx_, cy_ = hand[0] + 6, hand[1] + 2
             pts = [(cx_ - 13, cy_ - h * 0.27), (cx_ + 13, cy_ - h * 0.27), (cx_ + 15, cy_ + h * 0.05),
                    (cx_, cy_ + h * 0.3), (cx_ - 15, cy_ + h * 0.05)]
             poly(fill, pts)
-            poly(acc, pts, 3)
-            poly(dark, [(cx_, cy_ - 12), (cx_ + 7, cy_), (cx_, cy_ + 12), (cx_ - 7, cy_)])
+            poly(lerp_color(fill, WHITE, 0.22), [pts[0], (cx_, pts[0][1]), (cx_, pts[3][1]), pts[4]])    # lit half
+            poly(acc, pts, 2.5)
+            poly(dark, [(cx_, cy_ - 13), (cx_ + 8, cy_), (cx_, cy_ + 13), (cx_ - 8, cy_)])
+            halo(acc, (cx_, cy_), 7 + power * 0.08, 110 + power)
             C(acc, (cx_, cy_), 3)
+            for px_, py_ in ((-9, -h * 0.22), (9, -h * 0.22), (0, h * 0.22)):                # rivets
+                C(steel, (cx_ + px_, cy_ + py_), 1.6)
 
         limb(dark, sb, eb, hb_, aw + 2)
         if weapon == 'maul':
@@ -1990,41 +2122,53 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         else:
             maul(hb_, -2.0)
         limb(dark, hpb, kb, fb, lw + 2)
+        cl = chain('tabard', (hip[0] - w * 0.2, hip[1] + 2), 4, 7, 0.6, 0.84, 0.2)           # cloth at the back of the belt
+        ribbon(cl, mid, 13, 11)
+        line(acc, (cl[-1][0] - 5, cl[-1][1]), (cl[-1][0] + 5, cl[-1][1]), 2)
         C(dark, (sh[0] - w * 0.3, sh[1] + 3), w * 0.2)                                       # rear pauldron
         tw2, hw2 = w * 0.8, w * 0.52
-        torso(main, tw2, hw2)
         torso(dark, tw2, hw2)
-        torso(main, tw2 - 6, hw2 - 6, 2)
-        glow(s, acc, M((sh[0] + 2, (sh[1] + hip[1]) / 2)), 14, 110 + int(40 * math.sin(t * 0.1)))
-        line(acc, (sh[0] + 2, sh[1] + 8), (hip[0] + 2, hip[1] - 7), 3)                       # chest rune
-        line(acc, (sh[0] - 6, sh[1] + 16), (sh[0] + 2, sh[1] + 10), 3)
-        line(acc, (sh[0] + 10, sh[1] + 16), (sh[0] + 2, sh[1] + 10), 3)
+        torso(main, tw2 - 5, hw2 - 5, 2)
+        poly(light, [(sh[0] - tw2 / 2 + 5, sh[1] + 2), (sh[0] + tw2 / 2 - 5, sh[1] + 2),
+                     (sh[0] + tw2 / 2 - 9, sh[1] + 7), (sh[0] - tw2 / 2 + 9, sh[1] + 7)])    # chest highlight
+        halo(acc, (sh[0] + 2, (sh[1] + hip[1]) / 2), 14 + power * 0.1, 110 + int(40 * math.sin(t * 0.1)) + power)
+        line(acc, (sh[0] + 2, sh[1] + 9), (hip[0] + 2, hip[1] - 7), 2.5)                     # chest rune
+        line(acc, (sh[0] - 6, sh[1] + 17), (sh[0] + 2, sh[1] + 11), 2.5)
+        line(acc, (sh[0] + 10, sh[1] + 17), (sh[0] + 2, sh[1] + 11), 2.5)
         line(dark, (hip[0] - hw2 / 2, hip[1] + 1), (hip[0] + hw2 / 2, hip[1] + 1), 7)        # belt
-        C(acc, (hip[0] + 2, hip[1] + 1), 4)
+        box(acc, (hip[0] + 2, hip[1] + 1), 8, 6, 1)
         poly(mid, [(hip[0] + 2, hip[1] + 4), (hip[0] + hw2 / 2 + 2, hip[1] + 4),
                    (hip[0] + hw2 / 2 - 2, hip[1] + 16), (hip[0] + 4, hip[1] + 18)])          # tasset
-        limb(mid, hpf, kf, ff, lw + 2, dark)
+        line(acc, (hip[0] + 4, hip[1] + 17), (hip[0] + hw2 / 2 - 2, hip[1] + 15), 1.5)
+        limb(mid, hpf, kf, ff, lw + 2, lerp_color(dark, main, 0.25))
         C(main, kf, lw / 2 + 3)
         C(dark, kf, lw / 2 + 3, 2)
+        C(acc, kf, 2)
         for foot in (fb, ff):
-            r = pygame.Rect(0, 0, lw + 14, 13)
-            r.center = M((foot[0] + 4, foot[1] - 6))
-            D.rect(s, dark, r, border_radius=5)
-            D.line(s, acc, (r.left + 3, r.bottom - 3), (r.right - 3, r.bottom - 3), 2)
-        helm = pygame.Rect(0, 0, int(hr * 2 + 6), int(hr * 2 + 4))
-        helm.center = M(head)
-        D.rect(s, skin, helm, border_radius=8)
-        D.rect(s, dark, helm, 3, border_radius=8)
+            box(dark, (foot[0] + 4, foot[1] - 6), lw + 14, 13, 5)
+            line(acc, (foot[0] - 5, foot[1] - 2), (foot[0] + 13, foot[1] - 2), 1.5)
+        plume = chain('plume', (head[0] - hr * 0.5, head[1] - hr - 6), 5, 6, 0.2, 0.88, 0.4, 0.35)
+        ribbon(plume, main, 9, 2)
+        ribbon(plume[:4], light, 4, 1)
+        box(skin, head, hr * 2 + 6, hr * 2 + 4, 8)
+        box(steel, (head[0] + 1, head[1] - hr * 0.55), hr * 2 - 2, hr * 0.7, 5)              # brow plate
+        box(dark, head, hr * 2 + 6, hr * 2 + 4, 8, 2.5)
         poly(main, [(head[0] - hr * 0.9, head[1] - hr - 1), (head[0] + hr * 0.5, head[1] - hr - 1),
-                    (head[0] - hr * 0.2, head[1] - hr - 13), (head[0] - hr * 1.3, head[1] - hr - 7)])  # crest
-        glow(s, acc, M((head[0] + hr * 0.55, head[1])), 12, 120)
-        line(acc, (head[0] + hr * 0.05, head[1] - 2), (head[0] + hr + 1, head[1] - 2), 5)    # T-visor
-        line(acc, (head[0] + hr * 0.55, head[1] - 2), (head[0] + hr * 0.55, head[1] + hr * 0.7), 3)
+                    (head[0] - hr * 0.2, head[1] - hr - 11), (head[0] - hr * 1.1, head[1] - hr - 7)])  # crest
+        vis = 0.75 + 0.25 * math.sin(t * 0.13) if not pained else 0.35 + 0.3 * (int(t) % 6 < 3)
+        vcol = lerp_color(dark, acc, vis)
+        halo(acc, (head[0] + hr * 0.55, head[1]), 12 + power * 0.1, int(130 * vis) + power)
+        line(vcol, (head[0] + hr * 0.05, head[1] - 2), (head[0] + hr + 1, head[1] - 2), 1.5 if blink else 5)   # T-visor
+        line(vcol, (head[0] + hr * 0.55, head[1] - 2), (head[0] + hr * 0.55, head[1] + hr * 0.7), 3)
+        for k in (0.3, 0.55):                                                                # breath slits
+            line(dark, (head[0] - hr * 0.6, head[1] + hr * k), (head[0] - hr * 0.1, head[1] + hr * k), 1.5)
         C(main, (sh[0] + w * 0.16, sh[1] + 4), w * 0.25)                                     # front pauldron
-        C(dark, (sh[0] + w * 0.16, sh[1] + 4), w * 0.25, 3)
-        C(acc, (sh[0] + w * 0.16, sh[1] + 4), 3)
+        C(light, (sh[0] + w * 0.13, sh[1] + 1), w * 0.13)
+        C(dark, (sh[0] + w * 0.16, sh[1] + 4), w * 0.25, 2.5)
+        C(acc, (sh[0] + w * 0.16, sh[1] + 4), 2.5)
         limb(main, sf, ef, hf, aw + 2, mid)
         C(skin, hf, aw / 2 + 3)
+        C(dark, hf, aw / 2 + 3, 1.5)
         if weapon == 'maul':
             maul(hf, P['wp'])
         else:
@@ -2032,107 +2176,155 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
 
     elif style == 'voidcaller':
         # ---------------- NYX: hovering star-mage, layered robe, bent hat, star orb
-        stars = [(math.cos(t * 0.06 + i * math.tau / 3), math.sin(t * 0.06 + i * math.tau / 3)) for i in range(3)]
-        for cx_, sy_ in stars:
+        stars = [(math.cos(t * 0.06 + i * math.tau / 3), math.sin(t * 0.06 + i * math.tau / 3), i) for i in range(3)]
+
+        def orbit_star(cx_, sy_, i, size):
+            for back in (2, 1):                                                               # fading trail
+                a = t * 0.06 + i * math.tau / 3 - back * 0.16
+                poly(lerp_color(acc, dark, 0.35 * back), star_points(math.cos(a) * w * 0.95,
+                     sh[1] + h * 0.25 + math.sin(a) * 10, size - back * 1.5, t * 0.05))
+            poly(acc, star_points(cx_ * w * 0.95, sh[1] + h * 0.25 + sy_ * 10, size, t * 0.05))
+            C(WHITE, (cx_ * w * 0.95, sh[1] + h * 0.25 + sy_ * 10), 1.3)
+
+        for cx_, sy_, i in stars:
             if sy_ < 0:
-                poly(acc, star_points(cx_ * w * 0.95, sh[1] + h * 0.25 + sy_ * 10, 5, t * 0.05))
+                orbit_star(cx_, sy_, i, 5)
 
         def sleeve(elbow, hand, c1, c2):
             n = math.hypot(hand[0] - elbow[0], hand[1] - elbow[1]) or 1
             px, py = -(hand[1] - elbow[1]) / n, (hand[0] - elbow[0]) / n
-            pts = [elbow, (hand[0] + px * 9, hand[1] + py * 9), (hand[0] - px * 9, hand[1] - py * 9)]
+            sag = 3 + math.sin(t * 0.1) * 1.5
+            pts = [elbow, (hand[0] + px * 9, hand[1] + py * 9 + sag), (hand[0] - px * 9, hand[1] - py * 9)]
             poly(c1, pts)
-            line(c2, pts[1], pts[2], 3)
+            line(c2, pts[1], pts[2], 2.5)
 
         limb(dark, sb, eb, hb_, aw)
         sleeve(eb, hb_, mid, dark)
-        hx_ = hip[0] + tdx * 10 * flow
-        hem = [(hx_ + (i / 5 - 0.5) * w * 1.3, (i % 2) * -7 + math.sin(t * 0.15 + i) * 2) for i in range(6)]
-        poly(dark, [(sh[0] - tw / 2, sh[1]), (sh[0] + tw / 2, sh[1])] + hem[::-1])
-        poly(main, [(sh[0] - tw / 2 + 3, sh[1]), (sh[0] + tw / 2 - 3, sh[1]),
-                    (hx_ + w * 0.44, -16), (hx_ - w * 0.44, -16)])
-        line(acc, (hx_ - w * 0.44, -16), (hx_ + w * 0.44, -16), 3)
-        line(acc, (hip[0] - hw / 2, hip[1] - 4), (hip[0] + hw / 2, hip[1] - 2), 3)           # sash
-        for k, (ax, ay) in enumerate(((0.2, 0.3), (-0.25, 0.55), (0.3, 0.75))):
-            poly(light, star_points(sh[0] + ax * w * 0.6 + (hx_ - sh[0]) * ay, sh[1] + (-16 - sh[1]) * ay,
-                                    2.5 + (k == 1), t * 0.03))
+        hang = chain('robe', (hip[0], hip[1]), 3, -hip[1] / 3, 0.9, 0.82, 0.3)                # the robe swings like a bell
+        hx_, mx_ = hang[-1][0], hang[1][0]
+        hem = [(hx_ + (i / 6 - 0.5) * w * 1.35, hang[-1][1] + (i % 2) * -7 + math.sin(t * 0.15 + i) * 2) for i in range(7)]
+        poly(dark, [(sh[0] - tw / 2, sh[1]), (sh[0] + tw / 2, sh[1]), (mx_ + w * 0.5, hip[1] + 6)] + hem[::-1]
+             + [(mx_ - w * 0.5, hip[1] + 6)])
+        inner_y = hang[-1][1] - 16
+        poly(main, [(sh[0] - tw / 2 + 3, sh[1]), (sh[0] + tw / 2 - 3, sh[1]), (mx_ + w * 0.42, hip[1] + 4),
+                    (hx_ + w * 0.46, inner_y), (hx_ - w * 0.46, inner_y), (mx_ - w * 0.42, hip[1] + 4)])
+        poly(light, [(sh[0] + tw * 0.1, sh[1] + 2), (sh[0] + tw / 2 - 3, sh[1] + 2), (mx_ + w * 0.42, hip[1] + 4),
+                     (hx_ + w * 0.46, inner_y), (hx_ + w * 0.3, inner_y)])                    # lit front fold
+        line(acc, (hx_ - w * 0.46, inner_y), (hx_ + w * 0.46, inner_y), 2.5)
+        line(acc, (hip[0] - hw / 2, hip[1] - 4), (hip[0] + hw / 2, hip[1] - 2), 2.5)         # sash
+        ribbon(chain('nsash', (hip[0] - hw * 0.35, hip[1] - 2), 3, 7, 0.5, 0.86, 0.3), acc, 3.5, 1.5)
+        for k, (ax, ay) in enumerate(((0.2, 0.3), (-0.25, 0.55), (0.3, 0.75), (-0.1, 0.42))):
+            tw_ = 0.6 + 0.4 * math.sin(t * 0.12 + k * 2)                                      # twinkling robe stars
+            poly(lerp_color(main, WHITE, tw_), star_points(sh[0] + ax * w * 0.6 + (hx_ - sh[0]) * ay,
+                 sh[1] + (inner_y - sh[1]) * ay, 2 + tw_ * 1.5, t * 0.03))
         C(skin, head, hr)
         for ex in (0.2, 0.62):
-            glow(s, acc, M((head[0] + hr * ex, head[1] + 2)), 6, 140)
-            C(acc, (head[0] + hr * ex, head[1] + 2), 3)
-        brim = pygame.Rect(0, 0, int(hr * 3.4), int(hr * 0.9))
-        brim.center = M((head[0], head[1] - hr * 0.45))
-        D.ellipse(s, main, brim)
-        D.ellipse(s, dark, brim, 2)
-        m_ = (head[0] + tdx * 6, head[1] - hr * 1.7)
-        tip = (m_[0] + tdx * 14 * flow - 4, m_[1] - hr * 0.7 + tdy * 8)
-        poly(main, [(head[0] - hr * 0.95, head[1] - hr * 0.5), (head[0] + hr * 0.95, head[1] - hr * 0.5),
-                    (m_[0] + 5, m_[1]), tip, (m_[0] - 5, m_[1])])
-        line(acc, (head[0] - hr * 0.95, head[1] - hr * 0.55), (head[0] + hr * 0.95, head[1] - hr * 0.55), 4)
-        line(acc, tip, (tip[0], tip[1] + 8), 1)
-        poly(acc, star_points(tip[0], tip[1] + 11, 4, t * 0.1))                              # hat charm
+            halo(acc, (head[0] + hr * ex, head[1] + 2), 6, 150)
+            if blink or pained:
+                line(acc, (head[0] + hr * ex - 3, head[1] + 2), (head[0] + hr * ex + 3, head[1] + 2), 1.5)
+            else:
+                oval(acc, (head[0] + hr * ex, head[1] + 2), 5, 7)
+                C(WHITE, (head[0] + hr * ex + 0.5, head[1] + 1), 1.1)
+        oval(main, (head[0], head[1] - hr * 0.45), hr * 3.4, hr * 0.95)
+        oval(dark, (head[0], head[1] - hr * 0.45), hr * 3.4, hr * 0.95, 1.5)
+        cone = chain('hat', (head[0], head[1] - hr * 1.2), 3, hr * 0.62, -0.5, 0.84, 0.25)    # the bent tip sways
+        base_l, base_r = (head[0] - hr * 0.95, head[1] - hr * 0.5), (head[0] + hr * 0.95, head[1] - hr * 0.5)
+        poly(main, [base_l, base_r, (cone[1][0] + 5, cone[1][1]), (cone[2][0] + 2.5, cone[2][1]), cone[3],
+                    (cone[2][0] - 2.5, cone[2][1]), (cone[1][0] - 5, cone[1][1])])
+        poly(light, [base_r, (head[0] + hr * 0.3, head[1] - hr * 0.5), (cone[1][0] + 1, cone[1][1]), (cone[1][0] + 5, cone[1][1])])
+        line(acc, (head[0] - hr * 0.95, head[1] - hr * 0.55), (head[0] + hr * 0.95, head[1] - hr * 0.55), 3.5)
+        charm = chain('charm', cone[3], 2, 5, 0.6, 0.9, 0.2)
+        line(acc, charm[0], charm[2], 1)
+        poly(acc, star_points(charm[2][0], charm[2][1] + 2, 4.5, t * 0.1))
         limb(dark, sf, ef, hf, aw)
         sleeve(ef, hf, main, acc)
         C(skin, hf, 4)
         orb = P.get('orb', hf)
         if math.hypot(orb[0] - hf[0], orb[1] - hf[1]) > 16:
             line(acc, hf, orb, 1)
-        glow(s, acc, M(orb), 17, 160)
-        poly(WHITE, star_points(orb[0], orb[1], 8, t * 0.1))
+        pulse = 1 + 0.15 * math.sin(t * 0.2)
+        halo(acc, orb, 18 * pulse, 170)
+        for i in range(3):                                                                    # sparks circling the orb
+            a = t * 0.17 + i * math.tau / 3
+            C(WHITE, (orb[0] + math.cos(a) * 12, orb[1] + math.sin(a) * 12), 1.2)
+        poly(WHITE, star_points(orb[0], orb[1], 8.5 * pulse, t * 0.1))
         C(acc, orb, 3)
-        for cx_, sy_ in stars:
+        for cx_, sy_, i in stars:
             if sy_ >= 0:
-                poly(acc, star_points(cx_ * w * 0.95, sh[1] + h * 0.25 + sy_ * 10, 6, t * 0.05))
+                orbit_star(cx_, sy_, i, 6)
 
     else:
-        # ---------------- RHEA: brawler, flame hair, heavy gauntlets, baggy trousers
+        # ---------------- RHEA: brawler, living flame hair, heavy gauntlets, baggy trousers
         hot = info.get('hot', False)
+        fire = (col.get('flame', (240, 92, 24)), acc, (255, 250, 228))
         shade = lerp_color(skin, dark, 0.35)
         front_leg = lerp_color(dark, main, 0.3)
 
         def leg2(a, j, b, color):
             limb(color, a, j, b, lw + 4, color, lw)
-            C(acc, (j[0] + (b[0] - j[0]) * 0.8, j[1] + (b[1] - j[1]) * 0.8), lw / 2 + 1)     # ankle wrap
-            C(skin, (b[0] + 3, b[1] - 3), 5)
+            for k in (0.72, 0.86):                                                            # ankle wraps
+                q = (j[0] + (b[0] - j[0]) * k, j[1] + (b[1] - j[1]) * k)
+                line(acc, (q[0] - lw / 2, q[1]), (q[0] + lw / 2, q[1]), 2)
+            oval(skin, (b[0] + 3, b[1] - 3), 12, 8)
+
+        def gauntlet(elbow, hand, color, name):
+            n = math.hypot(hand[0] - elbow[0], hand[1] - elbow[1]) or 1
+            ux, uy = (hand[0] - elbow[0]) / n, (hand[1] - elbow[1]) / n
+            if hot:                                                                           # fists trail fire
+                halo(acc, hand, 20, 170)
+                flame_strand(chain(name, (hand[0] - ux * 2, hand[1] - uy * 2), 5, 6, -0.55, 0.78, 0.9), 13, fire, 3.0)
+            C(color, hand, aw / 2 + 5)
+            C(lerp_color(color, WHITE, 0.3), (hand[0] - 1.5, hand[1] - 2), aw / 2 + 1)
+            C(dark, hand, aw / 2 + 5, 1.5)
+            for k in (-1, 0, 1):                                                              # knuckle studs
+                C(acc, (hand[0] + ux * 5 - uy * k * 4, hand[1] + uy * 5 + ux * k * 4), 2)
 
         limb(shade, sb, eb, hb_, aw, mid, aw + 3)
-        C(mid, hb_, aw / 2 + 4)
+        gauntlet(eb, hb_, mid, 'fistb')
         leg2(hpb, kb, fb, dark)
-        ribbon(chain((head[0] - hr * 0.9, head[1] - hr * 0.25), 4, 7, 4, 0.6), dark, 4, 2)   # headband tails
+        ribbon(chain('band1', (head[0] - hr * 0.95, head[1] - hr * 0.3), 6, 6, 0.2, 0.9, 0.5, 0.4), dark, 4.5, 1.5)
+        ribbon(chain('band2', (head[0] - hr * 0.95, head[1] - hr * 0.2), 5, 6, 0.26, 0.9, 0.5, 0.4), mid, 4, 1.5)
         torso(skin, tw, hw)
+        line(shade, (hip[0] + 1, hip[1] - 9), (hip[0] + 1, hip[1] - 2), 1.5)                 # abs
+        line(shade, (hip[0] - 4, hip[1] - 6), (hip[0] + 6, hip[1] - 6), 1.5)
         k = 0.55
         poly(main, [(sh[0] - tw / 2, sh[1]), (sh[0] + tw / 2, sh[1]),
                     (sh[0] + tw / 2 + (hip[0] + hw / 2 - sh[0] - tw / 2) * k, sh[1] + (hip[1] - sh[1]) * k),
                     (sh[0] - tw / 2 + (hip[0] - hw / 2 - sh[0] + tw / 2) * k, sh[1] + (hip[1] - sh[1]) * k)])
+        poly(mid, [(sh[0] - tw / 2, sh[1]), (sh[0] - tw * 0.12, sh[1]),
+                   (sh[0] - tw * 0.16 + (hip[0] - sh[0]) * k, sh[1] + (hip[1] - sh[1]) * k),
+                   (sh[0] - tw / 2 + (hip[0] - hw / 2 - sh[0] + tw / 2) * k, sh[1] + (hip[1] - sh[1]) * k)])
         line(acc, (sh[0] - tw * 0.2, sh[1] + 2), (sh[0] + tw * 0.35, sh[1] + (hip[1] - sh[1]) * k), 2)
         line(acc, (hip[0] - hw / 2, hip[1]), (hip[0] + hw / 2, hip[1]), 5)                   # sash
-        ribbon(chain((hip[0] - hw * 0.4, hip[1] + 2), 3, 8, 3, 1.0), acc, 4)
+        ribbon(chain('rsash', (hip[0] - hw * 0.4, hip[1] + 2), 4, 7, 0.5, 0.86, 0.3), acc, 5, 2)
         leg2(hpf, kf, ff, front_leg)
-        for i in range(6):                                                                   # flame hair
-            base = (head[0] + (i - 2.5) * hr * 0.36 - 2, head[1] - hr * 0.5)
-            L = hr * (1.35 + 0.5 * math.sin(t * 0.33 + i * 1.9)) * (1.25 if hot else 1.0)
-            fx_, fy_ = tdx * 0.7 * flow, -1 + tdy * 0.3
-            fn = math.hypot(fx_, fy_) or 1
-            tp = (base[0] + fx_ / fn * L, base[1] + fy_ / fn * L)
-            poly(main if i % 2 else acc, [(base[0] - 7, base[1] + 4), (base[0] + 7, base[1] + 4), tp])
-            if i in (2, 3):
-                tp2 = (base[0] + fx_ / fn * L * 0.55, base[1] + fy_ / fn * L * 0.55)
-                poly((255, 250, 220), [(base[0] - 2, base[1] + 3), (base[0] + 2, base[1] + 3), tp2])
+        # the mane: five strands of fire, each a simulated rope that rises instead of hanging
+        grow = 1.3 if hot else 1.0
+        halo(fire[0], (head[0] - 2, head[1] - hr * 1.2), hr * 1.9 * grow, 80)
+        for i, (off, n_, wd) in enumerate(((-0.95, 5, 11), (0.75, 5, 10), (-0.5, 6, 14), (0.35, 6, 13), (-0.08, 8, 17))):
+            base = (head[0] + off * hr * 0.85 - 2, head[1] - hr * (0.55 + 0.3 * (1 - abs(off))))
+            pts = chain('mane%d' % i, base, n_, hr * 0.42 * grow, -0.62, 0.76, 1.0)
+            flame_strand(pts, wd * grow, fire, i * 1.7)
         C(skin, head, hr)
-        line(dark, (head[0] - hr, head[1] - hr * 0.3), (head[0] + hr, head[1] - hr * 0.38), 4)
-        C((50, 24, 16), (head[0] + hr * 0.5, head[1] + 1), 2.5)
-        line((50, 24, 16), (head[0] + hr * 0.2, head[1] - 4), (head[0] + hr * 0.8, head[1] - 2), 2)
-        if hot:
-            glow(s, acc, M(hf), 22, 170)
+        poly(fire[0], [(head[0] - hr * 0.98, head[1] - hr * 0.2), (head[0] - hr * 0.5, head[1] - hr * 1.05),
+                       (head[0] + hr * 0.75, head[1] - hr * 0.9), (head[0] + hr * 0.95, head[1] - hr * 0.42)])   # hairline
+        line(dark, (head[0] - hr, head[1] - hr * 0.3), (head[0] + hr, head[1] - hr * 0.38), 4.5)
+        C(acc, (head[0] + hr * 0.55, head[1] - hr * 0.34), 2)                                # headband stud
+        human_eye((head[0] + hr * 0.5, head[1] + hr * 0.1), hr * 0.19)
+        if not pained:
+            line(ink, (head[0] + hr * 0.15, head[1] - hr * 0.2), (head[0] + hr * 0.85, head[1] - hr * 0.02), 2)   # fierce brow
+        if striking or pained:
+            oval(ink, (head[0] + hr * 0.5, head[1] + hr * 0.58), 5, 4)                       # shout
+        else:
+            line(ink, (head[0] + hr * 0.3, head[1] + hr * 0.5), (head[0] + hr * 0.7, head[1] + hr * 0.58), 1.2)   # smirk
         limb(skin, sf, ef, hf, aw, main, aw + 3)
-        C(main, hf, aw / 2 + 5)
-        n = math.hypot(hf[0] - ef[0], hf[1] - ef[1]) or 1
-        C(acc, (hf[0] + (hf[0] - ef[0]) / n * 4, hf[1] + (hf[1] - ef[1]) / n * 4), 5)        # knuckles
+        line(acc, (ef[0] - 3, ef[1] + 1), (ef[0] + 3, ef[1] + 1), 2)
+        gauntlet(ef, hf, main, 'fistf')
 
-    pts = pygame.mask.from_surface(s, 40).outline(2)          # dark ink line around the silhouette
+    pts = pygame.mask.from_surface(s, 200).outline(3)         # dark ink line around the silhouette
     if len(pts) > 2:
-        D.lines(s, OUTLINE, True, pts, 2)
-    return s
+        D.lines(s, OUTLINE, True, pts, 2 * SS)
+    return pygame.transform.smoothscale(s, (SPR, SPR))
 
 
 def quick_sprite(spec, col, key, facing, t):
@@ -2587,7 +2779,9 @@ class StateTranslator:
             surf.blit(img, (SPR_CX - img.get_width() // 2, SPR_FEET - img.get_height()))
             return surf
         vel = ((c.vx + c.kbx) * c.facing, c.vy + c.kby)
-        return render_fighter_surface(c.spec, c.colors, c.pose, c.facing, c.anim, key, vel, info)
+        if c.cloth is None:
+            c.cloth = ClothSim()
+        return render_fighter_surface(c.spec, c.colors, c.pose, c.facing, c.anim, key, vel, info, c.cloth, (c.x, c.y))
 
     def update_visuals(self, surface, characters, physics, show_boxes=False):
         for c in characters.values():
@@ -2607,7 +2801,7 @@ class StateTranslator:
                     else:
                         spr.fill((int(r * k), int(g * k), int(b * k), 0), special_flags=pygame.BLEND_RGBA_ADD)
                 if v['outline']:
-                    pts = pygame.mask.from_surface(spr, 60).outline(3)
+                    pts = pygame.mask.from_surface(spr, 200).outline(3)
                     if len(pts) > 2:
                         pygame.draw.lines(spr, v['outline'], True, pts, 2)
                 if v['alpha'] < 255:
@@ -2620,6 +2814,12 @@ class StateTranslator:
                     if v['alpha'] < 255:
                         rot.set_alpha(v['alpha'])
                     surface.blit(rot, rot.get_rect(center=(c.x, c.y - c.h / 2)))
+                elif abs(c.squash) > 0.02:                           # squash and stretch, anchored at the feet
+                    kx, ky = 1 - c.squash * 0.6, 1 + c.squash
+                    spr2 = pygame.transform.smoothscale(spr, (int(SPR * kx), int(SPR * ky)))
+                    if v['alpha'] < 255:
+                        spr2.set_alpha(v['alpha'])
+                    surface.blit(spr2, (c.x - SPR_CX * kx, c.y - SPR_FEET * ky))
                 else:
                     surface.blit(spr, (c.x - SPR_CX, c.y - SPR_FEET))
             if c.current_move is DEATH_RAY:
@@ -2855,6 +3055,7 @@ class GameManager:
         while self.running:
             delta_time = min(self.clock.tick(FPS) / 1000.0, 0.1)
             accumulator += delta_time
+            self._watch_performance()
             self._handle_input_events()                               # 1. input
             steps = 0
             while accumulator >= step * 0.99 and steps < 3:
@@ -2865,6 +3066,15 @@ class GameManager:
             self._render_frame()                                      # 4. state translation + 5. render
             pygame.display.flip()
         pygame.quit()
+
+    def _watch_performance(self):
+        """If drawing is too slow for 60 FPS, switch the fighters to the cheaper single-resolution drawing."""
+        global SS
+        self.slow_frames = getattr(self, 'slow_frames', 0)
+        if self.scene == 'FIGHT' and not self.paused and SS > 1:
+            self.slow_frames = self.slow_frames + 1 if self.clock.get_rawtime() > 15 else max(0, self.slow_frames - 1)
+            if self.slow_frames > 90:
+                SS = 1
 
     def _handle_input_events(self):
         for e in pygame.event.get():
