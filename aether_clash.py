@@ -1640,6 +1640,7 @@ class AIController(CharacterController):
 # (stand-ins until real PNG assets exist)
 # =====================================================================
 SPR, SPR_CX, SPR_FEET = 340, 170, 262
+HIP_K, SH_K, HEAD_K = 0.43, 0.73, 0.15     # body proportions: hip height, shoulder height, head radius (x fighter height)
 OUTLINE = (22, 14, 34)
 MAUL_SLOTS = {'fsmash', 'usmash', 'dsmash', 'utilt', 'fair', 'bair', 'uair', 'nair'}   # Bronn swings his maul
 
@@ -1691,7 +1692,7 @@ def target_pose(spec, key, t, info=None):
     info = info or {}
     st = spec['stats']
     w, h, style = st['w'], st['h'], spec['style']
-    hipy, shy = -h * 0.38, -h * 0.68
+    hipy, shy = -h * HIP_K, -h * SH_K
     P = dict(hip=[0.0, hipy], sh=[0.0, shy], head=[0.0, 0.0],
              hf=[w * 0.42, shy + h * 0.14], hb=[w * 0.05, shy + h * 0.2],
              ff=[w * 0.3, 0.0], fb=[-w * 0.28, 0.0], spin=0.0, wp=-0.9)
@@ -1848,8 +1849,9 @@ def target_pose(spec, key, t, info=None):
     # ---- character-specific habits
     if style == 'weaver' and key == 'run':                    # blade trails behind in a low runner's carry
         P['hf'], P['wp'] = [-w * 0.45, shy + h * 0.3], 2.7
-    elif style == 'sentinel' and key in ('idle', 'run', 'jump', 'fall'):
+    elif style == 'sentinel' and key in ('idle', 'run', 'jump', 'fall', 'shield', 'parry'):
         P['hf'] = [w * 0.44, shy + h * 0.2]                   # shield always held out front
+        P['hb'] = [-w * 0.34, shy - h * 0.02 + (math.sin(t * 0.36) * 2 if key == 'run' else 0)]   # hammer hand raised
     elif style == 'voidcaller':
         if key == 'run':
             P['hf'], P['hb'] = [-w * 0.2, shy + h * 0.26], [-w * 0.55, shy + h * 0.2]
@@ -1910,12 +1912,14 @@ class ClothSim:
         return [((p[0] - self.ox) * self.f, p[1] - self.oy) for p in pts]
 
 
+PIXEL = 2       # size of one art pixel on screen (the whole arena is drawn on a 640x360 grid)
 SS = 2          # fighters are drawn at double size and scaled down, which smooths every edge
                 # (the Game Manager drops this to 1 on computers that cannot hold 60 FPS)
 
 
 def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), info=None, cloth=None, origin=(0, 0)):
     """Draws a fighter from a skeleton pose onto a transparent surface (feet at SPR_CX, SPR_FEET).
+    Every part gets a dark ink outline, a shadow side and a highlight, like hand-drawn sprite art.
     cloth: the fighter's ClothSim. Without one (menus) the flowing parts use a simple wave instead."""
     info = info or {}
     s = pygame.Surface((SPR * SS, SPR * SS), pygame.SRCALPHA)
@@ -1923,8 +1927,8 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
     st = spec['stats']
     w, h, style, f = st['w'], st['h'], spec['style'], facing
     main, dark, acc, skin = col['main'], col['dark'], col['accent'], col['skin']
-    mid, light = lerp_color(main, dark, 0.5), lerp_color(main, WHITE, 0.35)
-    ink = (36, 20, 34)
+    mid, light = lerp_color(main, dark, 0.5), lerp_color(main, WHITE, 0.3)
+    INK = (30, 18, 32)
     floaty = style == 'voidcaller' and key not in ('ledge', 'grabbed')
     yo = -(8 + math.sin(t * 0.07) * 3) if floaty else 0
     if cloth:
@@ -1937,8 +1941,18 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         x, y = M(p)
         D.circle(s, color, (int(x), int(y)), max(1, int(r * SS)), int(width * SS))
 
+    def oC(color, p, r, hl=True):                            # outlined ball with a highlight
+        C(INK, p, r + 1.1)
+        C(color, p, r)
+        if hl and r > 3:
+            C(lerp_color(color, WHITE, 0.28), (p[0] + r * 0.2, p[1] - r * 0.3), r * 0.45)
+
     def poly(color, pts, width=0):
         D.polygon(s, color, [M(p) for p in pts], int(width * SS))
+
+    def opoly(color, pts, ow=1.1):                           # filled shape with an ink outline
+        poly(color, pts)
+        D.polygon(s, INK, [M(p) for p in pts], max(1, int(ow * SS)))
 
     def line(color, a, b, width):
         D.line(s, color, M(a), M(b), max(1, int(width * SS)))
@@ -1948,25 +1962,33 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         r.center = M(center)
         D.rect(s, color, r, int(width * SS), border_radius=int(radius * SS))
 
+    def obox(color, center, bw, bh, radius=0):
+        box(color, center, bw, bh, radius)
+        box(INK, center, bw, bh, radius, 1.1)
+
     def oval(color, center, bw, bh, width=0):
         r = pygame.Rect(0, 0, int(bw * SS), int(bh * SS))
         r.center = M(center)
         D.ellipse(s, color, r, int(width * SS))
 
+    def ooval(color, center, bw, bh):
+        oval(INK, center, bw + 2.2, bh + 2.2)
+        oval(color, center, bw, bh)
+
     def halo(color, p, radius, alpha):
         glow(s, color, M(p), radius * SS, min(190, alpha))    # stays under the outline threshold
 
-    hr = max(13, w * 0.33)
+    hr = max(10.0, h * HEAD_K)
     hip, sh = P['hip'], P['sh']
-    leg, arm = h * 0.38 / 2 * 1.06, h * 0.2
-    lw, aw = max(7, int(w * 0.22)), max(6, int(w * 0.18))
+    leg, arm = h * HIP_K / 2 * 1.05, h * 0.21
+    lw, aw = max(8, int(w * 0.23)), max(6, int(w * 0.18))
     sf, sb = (sh[0] + 3, sh[1] + 3), (sh[0] - 4, sh[1] + 3)
     hpf, hpb = (hip[0] + 2, hip[1]), (hip[0] - 3, hip[1])
     kf, ff = ik(hpf, P['ff'], leg, leg, -1)
     kb, fb = ik(hpb, P['fb'], leg, leg, -1)
     ef, hf = ik(sf, P['hf'], arm, arm, 1)
     eb, hb_ = ik(sb, P['hb'], arm, arm, 1)
-    head = (sh[0] + (sh[0] - hip[0]) * 0.25 + P['head'][0], sh[1] - hr * 0.92 + P['head'][1])
+    head = (sh[0] + (sh[0] - hip[0]) * 0.25 + P['head'][0], sh[1] - hr * 0.95 + P['head'][1])
     blink = int(t) % 190 < 7
     pained = key in ('hurt', 'stun', 'grabbed')
     striking = key == 'attack' and info.get('phase') == 'strike'
@@ -1982,13 +2004,13 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         for i in range(1, n + 1):
             wv = math.sin(t * 0.22 + i * 0.9 + ph) * (2 + wave * 6) * i / n
             if gravity < 0:                                  # flames lick upward
-                pts.append((anchor[0] + tdx * seg * i * 0.35 + wv, anchor[1] - seg * i * 0.95))
+                pts.append((anchor[0] + (tdx * 0.35 - breeze * 2) * seg * i + wv, anchor[1] - seg * i * 0.95))
             else:
                 pts.append((anchor[0] + tdx * seg * i * flow - tdy * wv,
                             anchor[1] + tdy * seg * i * flow + tdx * wv + i * i * 0.3))
         return pts
 
-    def ribbon(pts, color, w0, w1=1.5, profile=None):
+    def ribbon(pts, color, w0, w1=1.5, profile=None, ink=False):
         """A smooth tapering strip along a chain of points."""
         n = len(pts)
         left, right = [], []
@@ -2000,239 +2022,300 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
             wd = (profile(u) if profile else w0 + (w1 - w0) * u) / 2
             left.append((p[0] - dy / d * wd, p[1] + dx / d * wd))
             right.append((p[0] + dy / d * wd, p[1] - dx / d * wd))
-        poly(color, left + right[::-1])
-        C(color, pts[0], (profile(0) if profile else w0) / 2)
+        if ink:
+            opoly(color, left + right[::-1])
+        else:
+            poly(color, left + right[::-1])
+            C(color, pts[0], (profile(0) if profile else w0) / 2)
+
+    def cloth_strip(name, anchor, n, seg, color, w0, w1, gravity=0.3, breeze=0.4, wave=0.5):
+        """A strip of cloth with an outline, a shaded underside and a ragged tip."""
+        pts = chain(name, anchor, n, seg, gravity, 0.9, wave, breeze)
+        ribbon(pts, color, w0, w1, ink=True)
+        ribbon(pts[1:], lerp_color(color, INK, 0.3), 0, profile=lambda u: (w0 + (w1 - w0) * u) * 0.32)
+        return pts
 
     def flame_strand(pts, width, colors, seed=0.0):
         """A tongue of fire along a chain: fat near the base, flickering, tapering to a point."""
-        for k, color in zip((1.0, 0.64, 0.32), colors):
-            cut = pts[:max(3, int(len(pts) * (0.55 + 0.45 * k)))]
+        for k, color in zip((1.0, 0.66, 0.36, 0.16), colors):
+            cut = pts[:max(3, int(len(pts) * (0.5 + 0.5 * k)))]
             ribbon(cut, color, 0, profile=lambda u, k=k: 2.2 * k + width * k * (0.5 + 0.5 * math.sin(math.pi * min(1.0, u * 2.6 + 0.2)))
                    * (1 - u) ** 0.6 * (0.82 + 0.18 * math.sin(t * 0.7 + u * 8 + seed)))
 
     def limb(color, a, j, b, width, color2=None, width2=None):
         c2, w2 = color2 or color, width2 or width
+        o = 2.3
+        line(INK, a, j, width + o)                           # ink first, so the joints have no seams
+        line(INK, j, b, w2 + o)
+        C(INK, a, (width + o) / 2)
+        C(INK, j, (max(width, w2) + o) / 2)
+        C(INK, b, (w2 + o) / 2)
         line(color, a, j, width)
         line(c2, j, b, w2)
         C(color, a, width / 2)
         C(color, j, max(width, w2) / 2)
         C(c2, b, w2 / 2)
+        for p, q, cc, ww in ((a, j, color, width), (j, b, c2, w2)):          # highlight along the upper edge
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            d = math.hypot(dx, dy) or 1
+            nx, ny = -dy / d, dx / d
+            if ny > 0:
+                nx, ny = -nx, -ny
+            off = ww * 0.24
+            line(lerp_color(cc, WHITE, 0.26), (p[0] + nx * off + dx * 0.12, p[1] + ny * off + dy * 0.12),
+                 (q[0] + nx * off - dx * 0.12, q[1] + ny * off - dy * 0.12), max(1.0, ww * 0.22))
 
-    tw, hw = w * 0.56, w * 0.44
+    def bands(a, b, color, ks, half, wd=1.6):                # cloth wraps / plate seams across a limb
+        d = math.hypot(b[0] - a[0], b[1] - a[1]) or 1
+        nx, ny = -(b[1] - a[1]) / d, (b[0] - a[0]) / d
+        for k in ks:
+            q = (a[0] + (b[0] - a[0]) * k, a[1] + (b[1] - a[1]) * k)
+            line(color, (q[0] - nx * half, q[1] - ny * half), (q[0] + nx * half, q[1] + ny * half), wd)
 
-    def torso(color, tw_, hw_, drop=4):
-        poly(color, [(sh[0] - tw_ / 2, sh[1]), (sh[0] + tw_ / 2, sh[1]),
-                     (hip[0] + hw_ / 2, hip[1] + drop), (hip[0] - hw_ / 2, hip[1] + drop)])
-        C(color, (sh[0] - tw_ / 2 + 3, sh[1] + 2), 3.5)       # rounded shoulders
-        C(color, (sh[0] + tw_ / 2 - 3, sh[1] + 2), 3.5)
+    tw, hw = w * 0.6, w * 0.46
+
+    def torso_pts(tw_, hw_, drop=4):
+        return [(sh[0] - tw_ / 2, sh[1] + 2), (sh[0] - tw_ / 2 + 3, sh[1] - 1), (sh[0] + tw_ / 2 - 3, sh[1] - 1),
+                (sh[0] + tw_ / 2, sh[1] + 2), (hip[0] + hw_ / 2, hip[1] + drop), (hip[0] - hw_ / 2, hip[1] + drop)]
+
+    def torso(color, tw_, hw_, drop=4, shade=None):
+        pts = torso_pts(tw_, hw_, drop)
+        poly(color, pts)
+        if shade:                                            # shadow down the back
+            poly(shade, [pts[0], pts[1], (sh[0] - tw_ * 0.16, sh[1] - 1), (hip[0] - hw_ * 0.22, hip[1] + drop), pts[5]])
+        D.polygon(s, INK, [M(p) for p in pts], max(1, int(1.1 * SS)))
 
     def human_eye(p, r):
         if pained:                                           # squeezed shut: ">"
-            line(ink, (p[0] - r, p[1] - r), (p[0] + r * 0.6, p[1]), 1.5)
-            line(ink, (p[0] - r, p[1] + r), (p[0] + r * 0.6, p[1]), 1.5)
+            line(INK, (p[0] - r, p[1] - r), (p[0] + r * 0.6, p[1]), 1.4)
+            line(INK, (p[0] - r, p[1] + r), (p[0] + r * 0.6, p[1]), 1.4)
         elif blink:
-            line(ink, (p[0] - r, p[1]), (p[0] + r, p[1]), 1.5)
+            line(INK, (p[0] - r, p[1]), (p[0] + r, p[1]), 1.4)
         else:
-            oval(WHITE, p, r * 2.3, r * 2.1)
-            C(ink, (p[0] + r * 0.35, p[1] + 0.3), r * 0.72)
-            C(WHITE, (p[0] + r * 0.6, p[1] - r * 0.35), r * 0.25)
+            oval(WHITE, p, r * 2.4, r * 2.2)
+            C(INK, (p[0] + r * 0.35, p[1] + 0.2), r * 0.78)
+            C(WHITE, (p[0] + r * 0.62, p[1] - r * 0.36), r * 0.26)
+
+    def face(eye_r=0.24, brow=1.6, scar=False):
+        """Skin, ear, eye, brow, nose and mouth shared by the two human fighters."""
+        fc = (head[0] + hr * 0.12, head[1] + hr * 0.12)
+        oC(skin, fc, hr * 0.9, hl=False)
+        poly(lerp_color(skin, dark, 0.28), [(fc[0] - hr * 0.86, fc[1] + hr * 0.1), (fc[0] - hr * 0.2, fc[1] + hr * 0.86),
+                                            (fc[0] - hr * 0.62, fc[1] + hr * 0.6)])                       # jaw shadow
+        C(lerp_color(skin, dark, 0.22), (fc[0] - hr * 0.5, fc[1] + hr * 0.12), hr * 0.2)                  # ear
+        human_eye((fc[0] + hr * 0.42, fc[1] - hr * 0.02), hr * eye_r)
+        if not pained:
+            line(INK, (fc[0] + hr * 0.08, fc[1] - hr * 0.32), (fc[0] + hr * 0.78, fc[1] - hr * 0.16), brow)
+        line(lerp_color(skin, dark, 0.4), (fc[0] + hr * 0.8, fc[1] + hr * 0.12), (fc[0] + hr * 0.88, fc[1] + hr * 0.3), 1.1)
+        if striking or pained:
+            oval(INK, (fc[0] + hr * 0.5, fc[1] + hr * 0.52), hr * 0.42, hr * 0.32)
+        else:
+            line(INK, (fc[0] + hr * 0.3, fc[1] + hr * 0.5), (fc[0] + hr * 0.68, fc[1] + hr * 0.46), 1.1)
+        if scar:
+            line(lerp_color(skin, dark, 0.5), (fc[0] + hr * 0.0, fc[1] + hr * 0.3), (fc[0] + hr * 0.34, fc[1] + hr * 0.14), 1.2)
 
     if style == 'weaver':
-        # ---------------- KAI: slim duelist, thread-blade, twin scarf tails
-        neck = (sh[0] - 3, sh[1] + 1)
+        # ---------------- KAI: spiky-haired duelist, tattered scarf and tunic, broad steel blade
         hairc, bandc = col.get('hair', dark), col.get('band', acc)
         wrapc, bootc = col.get('wrap', skin), col.get('boot', mid)
-        limb(mid, sb, eb, hb_, aw, lerp_color(wrapc, dark, 0.25))
-        limb(dark, hpb, kb, fb, lw + 3, dark, lw)                                            # baggy trousers
-        ribbon(chain('scarf2', (neck[0], neck[1] + 3), 8, 8, 0.2, 0.9, 0.6, 0.5), lerp_color(acc, dark, 0.3), 10, 3)
-        ribbon(chain('scarf1', neck, 9, 8, 0.16, 0.9, 0.6, 0.55), acc, 12, 3)
-        torso(main, tw, hw)
-        poly(mid, [(sh[0] - tw / 2, sh[1]), (sh[0] - tw * 0.1, sh[1]), (hip[0] - hw * 0.2, hip[1] + 4),
-                   (hip[0] - hw / 2, hip[1] + 4)])                                           # shaded back half
-        line(acc, (sh[0] + tw * 0.2, sh[1] + 1), (hip[0] + hw * 0.15, hip[1] + 3), 2)        # tunic trim
-        for i in range(3):                                                                    # toggles
-            ty_ = sh[1] + 6 + i * 6
-            line(light, (sh[0] + tw * 0.12, ty_), (sh[0] + tw * 0.3, ty_), 1.5)
-        line(dark, (hip[0] - hw / 2, hip[1]), (hip[0] + hw / 2, hip[1]), 6)                  # sash
-        C(acc, (hip[0] + hw * 0.3, hip[1]), 3.5)
-        ribbon(chain('sash', (hip[0] - hw * 0.3, hip[1] + 2), 4, 6, 0.5, 0.86, 0.3), dark, 5, 2)
-        limb(lerp_color(dark, main, 0.15), hpf, kf, ff, lw + 3, lerp_color(dark, main, 0.15), lw)
-        poly(main, [(hip[0] - hw / 2 - 1, hip[1] + 2), (hip[0] + hw / 2 + 1, hip[1] + 2), (hip[0] + hw / 2 + 3, hip[1] + 14),
-                    (hip[0] + hw * 0.25, hip[1] + 8), (hip[0] + 1, hip[1] + 16), (hip[0] - hw * 0.25, hip[1] + 9),
-                    (hip[0] - hw / 2 - 3, hip[1] + 15)])                                     # tattered tunic hem
-        for foot in (fb, ff):                                                                # wrapped boots
-            oval(bootc, (foot[0] + 3, foot[1] - 4), lw + 8, lw + 2)
-            for k in (-9, -12.5):
-                line(wrapc, (foot[0] - 4, foot[1] + k), (foot[0] + 4, foot[1] + k), 2)
-        oval(acc, (sh[0], sh[1] + 1), tw + 8, 11)                                            # scarf wound round the neck
-        oval(lerp_color(acc, dark, 0.3), (sh[0] - 3, sh[1] + 3), tw - 2, 4)
-        ribbon(chain('band1', (head[0] - hr * 0.9, head[1] - hr * 0.35), 6, 6, 0.2, 0.9, 0.5, 0.45), bandc, 5, 2)
-        ribbon(chain('band2', (head[0] - hr * 0.9, head[1] - hr * 0.25), 5, 6, 0.26, 0.9, 0.5, 0.4),
-               lerp_color(bandc, dark, 0.35), 4.5, 2)
-        for i in range(8):                                                                   # big spiky hair
-            a = math.radians(-18 - i * 27)
-            ln = hr * (1.75 + 0.14 * math.sin(t * 0.09 + i * 1.3) + (0.2 if i % 2 else 0))
-            poly(hairc if i % 2 else lerp_color(hairc, dark, 0.25),
-                 [(head[0] + math.cos(a - 0.34) * hr * 0.8, head[1] + math.sin(a - 0.34) * hr * 0.8),
-                  (head[0] + math.cos(a) * ln - 2, head[1] + math.sin(a) * ln * 0.95),
-                  (head[0] + math.cos(a + 0.34) * hr * 0.8, head[1] + math.sin(a + 0.34) * hr * 0.8)])
-        C(hairc, (head[0] - hr * 0.12, head[1] - hr * 0.22), hr * 0.98)
-        C(skin, (head[0] + hr * 0.14, head[1] + hr * 0.16), hr * 0.86)
-        for i, fx_ in enumerate((0.95, 0.5, 0.05)):                                          # fringe over the brow
-            poly(hairc, [(head[0] + hr * (fx_ - 0.3), head[1] - hr * 0.62), (head[0] + hr * (fx_ + 0.2), head[1] - hr * 0.66),
-                         (head[0] + hr * (fx_ + 0.12), head[1] - hr * (0.12 + 0.1 * i))])
-        line(bandc, (head[0] - hr * 0.95, head[1] - hr * 0.36), (head[0] + hr * 0.98, head[1] - hr * 0.46), 4)
-        line(lerp_color(bandc, WHITE, 0.3), (head[0] - hr * 0.6, head[1] - hr * 0.44), (head[0] + hr * 0.9, head[1] - hr * 0.52), 1)
-        human_eye((head[0] + hr * 0.48, head[1] + hr * 0.08), hr * 0.2)
-        if not pained:
-            line(ink, (head[0] + hr * 0.2, head[1] - hr * 0.22), (head[0] + hr * 0.8, head[1] - hr * 0.1), 1.5)
-        if striking or pained:
-            C(ink, (head[0] + hr * 0.5, head[1] + hr * 0.55), 1.8)                           # open mouth
-        else:
-            line(ink, (head[0] + hr * 0.35, head[1] + hr * 0.55), (head[0] + hr * 0.65, head[1] + hr * 0.5), 1)
-        limb(main, sf, ef, hf, aw, wrapc)
-        for k in (0.3, 0.5, 0.7):                                                            # arm wraps
-            line(lerp_color(wrapc, dark, 0.35), (ef[0] + (hf[0] - ef[0]) * k - 3, ef[1] + (hf[1] - ef[1]) * k),
-                 (ef[0] + (hf[0] - ef[0]) * k + 3, ef[1] + (hf[1] - ef[1]) * k), 1.2)
+        hair_hi, hair_lo = lerp_color(hairc, WHITE, 0.22), lerp_color(hairc, INK, 0.35)
+        pants, pants_hi = dark, lerp_color(dark, main, 0.3)
+        wrap_lo = lerp_color(wrapc, INK, 0.35)
+        neck = (sh[0] - 3, sh[1] + 1)
+        limb(mid, sb, eb, hb_, aw + 1, lerp_color(wrapc, INK, 0.2), aw)                      # far arm
+        bands(eb, hb_, wrap_lo, (0.3, 0.55, 0.8), aw / 2)
+        limb(lerp_color(pants, INK, 0.25), hpb, kb, fb, lw + 4, lerp_color(pants, INK, 0.25), lw + 1)   # far leg
+        cloth_strip('scarf2', (neck[0], neck[1] + 3), 8, 8, lerp_color(acc, INK, 0.25), 11, 6, 0.2, 0.5, 0.6)
+        tail = cloth_strip('scarf1', neck, 9, 8, acc, 13, 7, 0.16, 0.55, 0.6)
+        poly(INK, [tail[-1], (tail[-1][0] - 5, tail[-1][1] - 3), (tail[-1][0] - 4, tail[-1][1] + 3)])    # torn end
+        cloth_strip('sash', (hip[0] - hw * 0.3, hip[1] + 2), 4, 6, lerp_color(main, INK, 0.3), 7, 3, 0.5, 0.2, 0.3)
+        torso(main, tw, hw, 4, mid)
+        line(light, (sh[0] + tw * 0.05, sh[1] + 2), (sh[0] + tw * 0.38, sh[1] + 2), 1.5)
+        line(mid, (sh[0] + tw * 0.25, sh[1] + 3), (hip[0] + hw * 0.1, hip[1] + 2), 1.4)      # wrap-over fold
+        opoly(main, [(hip[0] - hw / 2 - 2, hip[1] + 1), (hip[0] + hw / 2 + 2, hip[1] + 1), (hip[0] + hw / 2 + 4, hip[1] + 15),
+                     (hip[0] + hw * 0.28, hip[1] + 9), (hip[0] + 1, hip[1] + 18), (hip[0] - hw * 0.25, hip[1] + 10),
+                     (hip[0] - hw / 2 - 4, hip[1] + 16)])                                    # tattered tunic skirt
+        limb(pants, hpf, kf, ff, lw + 4, pants_hi, lw + 1)                                   # near leg
+        opoly(lerp_color(main, WHITE, 0.08), [(hip[0] - 1, hip[1] + 1), (hip[0] + hw / 2 + 2, hip[1] + 1),
+                                              (hip[0] + hw / 2 + 4, hip[1] + 15), (hip[0] + hw * 0.22, hip[1] + 10)])
+        line(lerp_color(acc, INK, 0.25), (hip[0] - hw / 2 - 1, hip[1]), (hip[0] + hw / 2 + 1, hip[1]), 5.5)   # rope belt
+        line(acc, (hip[0] - hw / 2, hip[1] - 1), (hip[0] + hw / 2, hip[1] - 1), 2.2)
+        oC((176, 182, 198), (hip[0] + hw * 0.25, hip[1] + 4), 2.6, hl=False)                 # belt ring
+        C(INK, (hip[0] + hw * 0.25, hip[1] + 4), 1.1)
+        for knee, foot in ((kb, fb), (kf, ff)):                                              # shin wraps and shoes
+            bands(knee, foot, wrapc, (0.55, 0.7, 0.85), (lw + 1) / 2 + 0.5, 2.2)
+            ooval(bootc, (foot[0] + 3, foot[1] - 4), lw + 9, lw + 1)
+            oval(lerp_color(bootc, WHITE, 0.25), (foot[0] + 5, foot[1] - 6), lw + 1, 3)
+        ooval(acc, (sh[0], sh[1] + 1), tw + 9, 12)                                           # scarf wound round the neck
+        oval(lerp_color(acc, INK, 0.28), (sh[0] - 3, sh[1] + 4), tw + 2, 4)
+        oval(lerp_color(acc, WHITE, 0.3), (sh[0] + 4, sh[1] - 2), tw * 0.5, 2.5)
+        cloth_strip('band2', (head[0] - hr * 0.9, head[1] - hr * 0.25), 5, 6, lerp_color(bandc, INK, 0.35), 5, 2.5, 0.26, 0.4)
+        cloth_strip('band1', (head[0] - hr * 0.9, head[1] - hr * 0.35), 6, 6, bandc, 5.5, 2.5, 0.2, 0.45)
+        for i in range(10):                                                                  # a big, wild mane
+            a = math.radians(-8 - i * 24)
+            ln = hr * (2.05 + 0.14 * math.sin(t * 0.09 + i * 1.3) + (0.28 if i % 2 else 0))
+            opoly((hairc, hair_lo, hair_hi)[i % 3],
+                  [(head[0] + math.cos(a - 0.36) * hr * 0.9, head[1] + math.sin(a - 0.36) * hr * 0.9),
+                   (head[0] + math.cos(a) * ln - 2, head[1] + math.sin(a) * ln * 0.95 - 1),
+                   (head[0] + math.cos(a + 0.36) * hr * 0.9, head[1] + math.sin(a + 0.36) * hr * 0.9)])
+        oC(hairc, (head[0] - hr * 0.14, head[1] - hr * 0.24), hr * 1.05, hl=False)
+        C(hair_hi, (head[0] - hr * 0.05, head[1] - hr * 0.7), hr * 0.4)
+        face(0.25)
+        for i, fx_ in enumerate((0.95, 0.5, 0.05, -0.4)):                                    # fringe over the brow
+            opoly(hair_hi if i == 1 else hairc,
+                  [(head[0] + hr * (fx_ - 0.34), head[1] - hr * 0.7), (head[0] + hr * (fx_ + 0.22), head[1] - hr * 0.74),
+                   (head[0] + hr * (fx_ + 0.12), head[1] - hr * (0.16 + 0.1 * i))])
+        line(INK, (head[0] - hr * 0.98, head[1] - hr * 0.4), (head[0] + hr * 1.02, head[1] - hr * 0.52), 6)
+        line(bandc, (head[0] - hr * 0.95, head[1] - hr * 0.4), (head[0] + hr * 0.98, head[1] - hr * 0.52), 4)
+        line(lerp_color(bandc, WHITE, 0.35), (head[0] - hr * 0.6, head[1] - hr * 0.5), (head[0] + hr * 0.9, head[1] - hr * 0.6), 1.1)
+        limb(main, sf, ef, hf, aw + 1, wrapc, aw)                                            # near arm: sleeve, wrapped forearm
+        bands(ef, hf, wrap_lo, (0.25, 0.45, 0.65, 0.85), aw / 2)
         bx, by = math.cos(P['wp']), math.sin(P['wp'])
-        tip = (hf[0] + bx * 50, hf[1] + by * 50)
+        nx_, ny_ = -by, bx
+        tip = (hf[0] + bx * 52, hf[1] + by * 52)
         ribbon(chain('thread', (hf[0] - bx * 8, hf[1] - by * 8), 6, 6, 0.25, 0.9, 0.5), acc, 1.5, 1)
-        nx_, ny_ = -by, bx                                                                   # a short, broad steel blade
-        poly((96, 102, 122), [(hf[0] + nx_ * 4.6, hf[1] + ny_ * 4.6), (hf[0] - nx_ * 4.6, hf[1] - ny_ * 4.6),
-                              (hf[0] + bx * 40 - nx_ * 3.4, hf[1] + by * 40 - ny_ * 3.4), tip,
-                              (hf[0] + bx * 40 + nx_ * 3.4, hf[1] + by * 40 + ny_ * 3.4)])
-        poly((186, 194, 210), [(hf[0] + nx_ * 3.2, hf[1] + ny_ * 3.2), (hf[0] - nx_ * 3.2, hf[1] - ny_ * 3.2),
-                               (hf[0] + bx * 40 - nx_ * 2.2, hf[1] + by * 40 - ny_ * 2.2), (hf[0] + bx * 48, hf[1] + by * 48),
-                               (hf[0] + bx * 40 + nx_ * 2.2, hf[1] + by * 40 + ny_ * 2.2)])
-        poly(WHITE, [(hf[0] + nx_ * 3.2, hf[1] + ny_ * 3.2), (hf[0] + nx_ * 0.6, hf[1] + ny_ * 0.6),
-                     (hf[0] + bx * 46, hf[1] + by * 46), (hf[0] + bx * 40 + nx_ * 2.2, hf[1] + by * 40 + ny_ * 2.2)])
-        g_ = 18 + 14 * math.sin(t * 0.09)
-        C(WHITE, (hf[0] + bx * g_, hf[1] + by * g_), 1.5)                                    # glint
-        line((70, 74, 92), (hf[0] + bx * 3 - by * 9, hf[1] + by * 3 + bx * 9), (hf[0] + bx * 3 + by * 9, hf[1] + by * 3 - bx * 9), 3.5)
-        line((120, 86, 60), (hf[0] - bx * 7, hf[1] - by * 7), (hf[0] + bx * 2, hf[1] + by * 2), 3.5)
-        C((150, 156, 172), (hf[0] - bx * 8, hf[1] - by * 8), 2.6)                            # pommel ring
-        C((70, 74, 92), (hf[0] - bx * 8, hf[1] - by * 8), 2.6, 1)
-        C(wrapc, hf, 4.5)
+        opoly((150, 158, 176), [(hf[0] + nx_ * 4.2, hf[1] + ny_ * 4.2), (hf[0] - nx_ * 4.2, hf[1] - ny_ * 4.2),
+                                (hf[0] + bx * 42 - nx_ * 3.2, hf[1] + by * 42 - ny_ * 3.2), tip,
+                                (hf[0] + bx * 42 + nx_ * 3.2, hf[1] + by * 42 + ny_ * 3.2)])           # a short, broad blade
+        poly((226, 232, 242), [(hf[0] + nx_ * 3.4, hf[1] + ny_ * 3.4), (hf[0] + nx_ * 0.4, hf[1] + ny_ * 0.4),
+                               (hf[0] + bx * 49, hf[1] + by * 49), (hf[0] + bx * 42 + nx_ * 2.4, hf[1] + by * 42 + ny_ * 2.4)])
+        line((96, 102, 122), (hf[0] + bx * 4, hf[1] + by * 4), (hf[0] + bx * 44, hf[1] + by * 44), 1)     # fuller
+        g_ = 20 + 16 * math.sin(t * 0.09)
+        C(WHITE, (hf[0] + bx * g_ + nx_ * 2, hf[1] + by * g_ + ny_ * 2), 1.5)                # glint
+        line(INK, (hf[0] + bx * 3 - by * 10, hf[1] + by * 3 + bx * 10), (hf[0] + bx * 3 + by * 10, hf[1] + by * 3 - bx * 10), 5.5)
+        line((120, 126, 146), (hf[0] + bx * 3 - by * 9, hf[1] + by * 3 + bx * 9), (hf[0] + bx * 3 + by * 9, hf[1] + by * 3 - bx * 9), 3.2)
+        line((110, 76, 52), (hf[0] - bx * 7, hf[1] - by * 7), (hf[0] + bx * 1, hf[1] + by * 1), 3.5)
+        oC((176, 182, 198), (hf[0] - bx * 9, hf[1] - by * 9), 2.6, hl=False)                 # pommel ring
+        oC(skin, hf, 4.4, hl=False)
 
     elif style == 'sentinel':
-        # ---------------- BRONN: plated guardian, kite shield + stone maul
+        # ---------------- BRONN: bucket-helmed guardian in blue stone plate, great hammer, gem shield
         weapon = info.get('weapon', 'shield')
-        power = 60 if striking else 0                        # runes flare when he strikes
+        power = 60 if striking else 0                        # the gem and visor flare when he strikes
         steel, stone, beltc = col.get('steel', lerp_color(skin, WHITE, 0.25)), col.get('stone', skin), col.get('belt', dark)
+        plate_hi, plate_lo = lerp_color(main, WHITE, 0.28), lerp_color(main, INK, 0.4)
 
         def maul(hand, a):
             bx, by = math.cos(a), math.sin(a)
             end = (hand[0] + bx * 50, hand[1] + by * 50)
-            line((84, 58, 42), (hand[0] - bx * 13, hand[1] - by * 13), end, 6)
-            line((134, 98, 66), (hand[0] - bx * 13, hand[1] - by * 13), end, 2.5)
-            C((70, 74, 90), (hand[0] - bx * 13, hand[1] - by * 13), 3.5)                      # pommel cap
-            blk = [(end[0] + bx * 15 - by * 22, end[1] + by * 15 + bx * 22), (end[0] + bx * 15 + by * 22, end[1] + by * 15 - bx * 22),
-                   (end[0] - bx * 15 + by * 22, end[1] - by * 15 - bx * 22), (end[0] - bx * 15 - by * 22, end[1] - by * 15 + bx * 22)]
+            line(INK, (hand[0] - bx * 14, hand[1] - by * 14), end, 8)
+            line((92, 62, 44), (hand[0] - bx * 13, hand[1] - by * 13), end, 5.5)
+            line((146, 106, 70), (hand[0] - bx * 13 - by * 1.2, hand[1] - by * 13 + bx * 1.2), (end[0] - by * 1.2, end[1] + bx * 1.2), 1.8)
+            oC((84, 88, 104), (hand[0] - bx * 14, hand[1] - by * 14), 3.2, hl=False)          # pommel cap
+            blk = [(end[0] + bx * 16 - by * 23, end[1] + by * 16 + bx * 23), (end[0] + bx * 16 + by * 23, end[1] + by * 16 - bx * 23),
+                   (end[0] - bx * 16 + by * 23, end[1] - by * 16 - bx * 23), (end[0] - bx * 16 - by * 23, end[1] - by * 16 + bx * 23)]
             poly(stone, blk)                                                                  # a great block of stone
-            poly(lerp_color(stone, WHITE, 0.3), [blk[0], blk[1], (end[0] + bx * 7 + by * 22, end[1] + by * 7 - bx * 22),
-                                                 (end[0] + bx * 7 - by * 22, end[1] + by * 7 + bx * 22)])
-            poly(lerp_color(stone, (0, 0, 0), 0.3), [blk[2], blk[3], (end[0] - bx * 9 - by * 22, end[1] - by * 9 + bx * 22),
-                                                     (end[0] - bx * 9 + by * 22, end[1] - by * 9 - bx * 22)])
-            poly((52, 56, 70), blk, 2)
-            poly((70, 74, 90), [(end[0] + bx * 8, end[1] + by * 8), (end[0] - by * 7, end[1] + bx * 7),
-                                (end[0] - bx * 8, end[1] - by * 8), (end[0] + by * 7, end[1] - bx * 7)])    # emblem
-            line((52, 56, 70), (end[0] + bx * 4 - by * 20, end[1] + by * 4 + bx * 20),
-                 (end[0] - bx * 6 - by * 13, end[1] - by * 6 + bx * 13), 1.2)                 # crack
+            poly(lerp_color(stone, WHITE, 0.32), [blk[0], blk[1], (end[0] + bx * 8 + by * 23, end[1] + by * 8 - bx * 23),
+                                                  (end[0] + bx * 8 - by * 23, end[1] + by * 8 + bx * 23)])
+            poly(lerp_color(stone, INK, 0.35), [blk[2], blk[3], (end[0] - bx * 9 - by * 23, end[1] - by * 9 + bx * 23),
+                                                (end[0] - bx * 9 + by * 23, end[1] - by * 9 - bx * 23)])
+            poly(INK, blk, 1.4)
+            opoly((78, 82, 98), [(end[0] + bx * 8, end[1] + by * 8), (end[0] - by * 7, end[1] + bx * 7),
+                                 (end[0] - bx * 8, end[1] - by * 8), (end[0] + by * 7, end[1] - bx * 7)], 0.8)   # emblem
+            line(INK, (end[0] + bx * 5 - by * 21, end[1] + by * 5 + bx * 21), (end[0] - bx * 5 - by * 13, end[1] - by * 5 + bx * 13), 1.1)
+            line(INK, (end[0] + bx * 10 + by * 12, end[1] + by * 10 - bx * 12), (end[0] + bx * 2 + by * 19, end[1] + by * 2 - bx * 19), 1.1)
             if power:
-                halo(acc, end, 16, 150)
+                halo(acc, end, 18, 160)
 
         def shield(hand, fill):
             cx_, cy_ = hand[0] + 6, hand[1] + 2
-            pts = [(cx_ - 14, cy_ - h * 0.28), (cx_ + 14, cy_ - h * 0.28), (cx_ + 16, cy_ + h * 0.05),
-                   (cx_, cy_ + h * 0.32), (cx_ - 16, cy_ + h * 0.05)]
-            poly(steel, pts)                                                                  # steel rim
-            inner = [(cx_ - 10, cy_ - h * 0.24), (cx_ + 10, cy_ - h * 0.24), (cx_ + 12, cy_ + h * 0.04),
-                     (cx_, cy_ + h * 0.26), (cx_ - 12, cy_ + h * 0.04)]
-            poly(fill, inner)
-            poly(lerp_color(fill, WHITE, 0.2), [inner[0], (cx_, inner[0][1]), (cx_, inner[3][1]), inner[4]])
-            poly((60, 66, 84), pts, 1.5)
-            halo(acc, (cx_, cy_ - 1), 9 + power * 0.08, 130 + power)
-            gem = [(cx_, cy_ - 11), (cx_ + 6, cy_ - 1), (cx_, cy_ + 9), (cx_ - 6, cy_ - 1)]
-            poly(acc, gem)                                                                    # glowing gem
-            poly(WHITE, [gem[0], (cx_ + 2, cy_ - 2), (cx_ - 2, cy_ - 2)])
-            poly((40, 110, 130), gem, 1)
-            for px_, py_ in ((-10, -h * 0.25), (10, -h * 0.25), (0, h * 0.27), (-13, 0), (13, 0)):   # rivets
-                C((70, 74, 92), (cx_ + px_, cy_ + py_), 1.5)
+            pts = [(cx_ - 15, cy_ - h * 0.29), (cx_ + 15, cy_ - h * 0.29), (cx_ + 17, cy_ + h * 0.05),
+                   (cx_, cy_ + h * 0.33), (cx_ - 17, cy_ + h * 0.05)]
+            opoly(steel, pts, 1.3)                                                            # steel rim
+            poly(lerp_color(steel, WHITE, 0.35), [pts[0], pts[1], (pts[1][0] - 2, pts[1][1] + 3), (pts[0][0] + 2, pts[0][1] + 3)])
+            inner = [(cx_ - 10.5, cy_ - h * 0.24), (cx_ + 10.5, cy_ - h * 0.24), (cx_ + 12.5, cy_ + h * 0.04),
+                     (cx_, cy_ + h * 0.26), (cx_ - 12.5, cy_ + h * 0.04)]
+            opoly(fill, inner, 0.9)
+            poly(lerp_color(fill, WHITE, 0.22), [inner[0], (cx_, inner[0][1]), (cx_, inner[3][1]), inner[4]])
+            line(lerp_color(fill, INK, 0.4), (cx_ + 4, cy_ - h * 0.2), (cx_ + 8, cy_ - h * 0.1), 1)       # battle scratches
+            line(lerp_color(fill, INK, 0.4), (cx_ - 7, cy_ + h * 0.1), (cx_ - 3, cy_ + h * 0.16), 1)
+            halo(acc, (cx_, cy_ - 1), 10 + power * 0.08, 140 + power)
+            gem = [(cx_, cy_ - 12), (cx_ + 6.5, cy_ - 1), (cx_, cy_ + 10), (cx_ - 6.5, cy_ - 1)]
+            opoly(acc, gem, 0.9)                                                              # glowing gem
+            poly(WHITE, [gem[0], (cx_ + 2.4, cy_ - 2), (cx_ - 2.4, cy_ - 2)])
+            for px_, py_ in ((-11, -h * 0.262), (11, -h * 0.262), (0, h * 0.29), (-14, 0), (14, 0)):      # rivets
+                C(INK, (cx_ + px_, cy_ + py_), 1.5)
 
-        limb(dark, sb, eb, hb_, aw + 2)
+        limb(plate_lo, sb, eb, hb_, aw + 3, plate_lo, aw + 3)                                # far arm
+        oC(plate_lo, hb_, aw / 2 + 3.5, hl=False)
         if weapon == 'maul':
             shield(hb_, mid)
         else:
-            maul(hb_, -2.0)
-        limb(dark, hpb, kb, fb, lw + 2)
-        C(dark, (sh[0] - w * 0.3, sh[1] + 3), w * 0.2)                                       # rear pauldron
-        tw2, hw2 = w * 0.8, w * 0.52
-        torso(dark, tw2, hw2)
-        torso(main, tw2 - 5, hw2 - 5, 2)
-        poly(light, [(sh[0] - tw2 / 2 + 5, sh[1] + 2), (sh[0] + tw2 / 2 - 5, sh[1] + 2),
-                     (sh[0] + tw2 / 2 - 9, sh[1] + 7), (sh[0] - tw2 / 2 + 9, sh[1] + 7)])    # chest highlight
+            maul(hb_, -1.72)                                                                  # hammer raised behind his head
+        limb(plate_lo, hpb, kb, fb, lw + 4, plate_lo, lw + 3)                                # far leg
+        oC(plate_lo, (sh[0] - w * 0.3, sh[1] + 3), w * 0.2, hl=False)                        # rear pauldron
+        tw2, hw2 = w * 0.82, w * 0.56
+        torso(main, tw2, hw2, 4, mid)
+        poly(plate_hi, [(sh[0] - tw2 * 0.1, sh[1] + 1), (sh[0] + tw2 / 2 - 3, sh[1] + 1),
+                        (sh[0] + tw2 / 2 - 6, sh[1] + 6), (sh[0] - tw2 * 0.06, sh[1] + 6)])  # chest highlight
         for k in (0.36, 0.68):                                                               # segmented stone plates
             yy = sh[1] + (hip[1] - sh[1]) * k
-            xw = (tw2 + (hw2 - tw2) * k) / 2 - 3
-            line(dark, (sh[0] + (hip[0] - sh[0]) * k - xw, yy), (sh[0] + (hip[0] - sh[0]) * k + xw, yy), 1.5)
-        line(dark, (sh[0] + 1, sh[1] + 3), (hip[0] + 1, hip[1] - 2), 1.5)
-        line(dark, (sh[0] - 8, sh[1] + 9), (sh[0] - 5, sh[1] + 13), 1)                       # cracks
-        line(dark, (sh[0] - 5, sh[1] + 13), (sh[0] - 9, sh[1] + 16), 1)
-        line(beltc, (hip[0] - hw2 / 2, hip[1] + 1), (hip[0] + hw2 / 2, hip[1] + 1), 7)       # leather belt
-        box(steel, (hip[0] + 2, hip[1] + 1), 8, 7, 1)
-        poly(mid, [(hip[0] + 2, hip[1] + 4), (hip[0] + hw2 / 2 + 2, hip[1] + 4),
-                   (hip[0] + hw2 / 2 - 2, hip[1] + 16), (hip[0] + 4, hip[1] + 18)])          # tasset
-        limb(mid, hpf, kf, ff, lw + 2, lerp_color(dark, main, 0.25))
-        C(main, kf, lw / 2 + 3)
-        C(dark, kf, lw / 2 + 3, 2)
-        C(light, (kf[0] - 1, kf[1] - 1.5), 2)
+            xw = (tw2 + (hw2 - tw2) * k) / 2 - 1
+            xc = sh[0] + (hip[0] - sh[0]) * k
+            line(INK, (xc - xw, yy), (xc + xw, yy), 1.3)
+            line(plate_hi, (xc - xw * 0.1, yy + 1.6), (xc + xw - 2, yy + 1.6), 1)
+        line(INK, (sh[0] + 1, sh[1] + 2), (hip[0] + 1, hip[1] - 1), 1.2)
+        line(INK, (sh[0] - 8, sh[1] + 9), (sh[0] - 5, sh[1] + 13), 1)                        # cracks
+        line(INK, (sh[0] - 5, sh[1] + 13), (sh[0] - 9, sh[1] + 16), 1)
+        line(INK, (sh[0] + 9, sh[1] + 16), (sh[0] + 12, sh[1] + 21), 1)
+        line(INK, (hip[0] - hw2 / 2 - 1, hip[1] + 1), (hip[0] + hw2 / 2 + 1, hip[1] + 1), 8.5)
+        line(beltc, (hip[0] - hw2 / 2, hip[1] + 1), (hip[0] + hw2 / 2, hip[1] + 1), 6)       # leather belt
+        line(lerp_color(beltc, WHITE, 0.25), (hip[0] - hw2 / 2, hip[1] - 1), (hip[0] + hw2 / 2, hip[1] - 1), 1.2)
+        obox(steel, (hip[0] + 2, hip[1] + 1), 8, 8, 1)
+        opoly(mid, [(hip[0] - 2, hip[1] + 5), (hip[0] + hw2 / 2 + 3, hip[1] + 5),
+                    (hip[0] + hw2 / 2 - 1, hip[1] + 17), (hip[0] + 2, hip[1] + 19)])         # tasset
+        limb(main, hpf, kf, ff, lw + 4, mid, lw + 3)                                         # near leg
+        bands(kf, ff, INK, (0.5,), (lw + 3) / 2, 1.2)
+        oC(main, kf, lw / 2 + 3.5)                                                           # knee cop
         for foot in (fb, ff):
-            box(dark, (foot[0] + 4, foot[1] - 6), lw + 14, 13, 5)
-            line(mid, (foot[0] - 5, foot[1] - 2), (foot[0] + 13, foot[1] - 2), 1.5)
-        box(dark, (head[0] - hr * 0.5, head[1] + hr * 0.95), hr * 1.6, 7, 3)                 # gorget
-        box(skin, head, hr * 2 + 6, hr * 2 + 5, 7)                                           # bucket great-helm
-        box(lerp_color(skin, WHITE, 0.28), (head[0] + 1, head[1] - hr * 0.72), hr * 2 - 2, hr * 0.5, 5)
-        poly(mid, [(head[0] - hr - 3, head[1] - hr * 0.4), (head[0] - hr * 0.35, head[1] - hr * 0.4),
-                   (head[0] - hr * 0.35, head[1] + hr + 2), (head[0] - hr - 3, head[1] + hr + 2)])   # shaded back plate
-        box(dark, head, hr * 2 + 6, hr * 2 + 5, 7, 2.5)
-        line(dark, (head[0] - hr - 2, head[1] - hr * 0.42), (head[0] + hr + 2, head[1] - hr * 0.42), 1.5)
-        for rx in (-0.7, 0.0, 0.7):                                                          # rivets
-            C(dark, (head[0] + hr * rx, head[1] - hr * 0.72), 1.4)
-        vis = 0.75 + 0.25 * math.sin(t * 0.13) if not pained else 0.35 + 0.3 * (int(t) % 6 < 3)
-        vcol = lerp_color(dark, acc, vis)
-        halo(acc, (head[0] + hr * 0.55, head[1]), 12 + power * 0.1, int(130 * vis) + power)
-        line((16, 22, 40), (head[0] - hr * 0.1, head[1] - 1), (head[0] + hr + 2, head[1] - 1), 7.5)
-        line((16, 22, 40), (head[0] + hr * 0.5, head[1] - 1), (head[0] + hr * 0.5, head[1] + hr * 0.85), 6)
-        line(vcol, (head[0], head[1] - 1), (head[0] + hr + 1, head[1] - 1), 1.5 if blink else 5)     # glowing T-visor
-        line(vcol, (head[0] + hr * 0.5, head[1] - 1), (head[0] + hr * 0.5, head[1] + hr * 0.75), 3.6)
-        for k in (0.3, 0.55):                                                                # breath slits
-            line(dark, (head[0] - hr * 0.6, head[1] + hr * k), (head[0] - hr * 0.1, head[1] + hr * k), 1.5)
-        C(main, (sh[0] + w * 0.16, sh[1] + 4), w * 0.25)                                     # front pauldron
-        C(light, (sh[0] + w * 0.13, sh[1] + 1), w * 0.13)
-        C(dark, (sh[0] + w * 0.16, sh[1] + 4), w * 0.25, 2.5)
-        line(dark, (sh[0] + w * 0.16 - w * 0.2, sh[1] + 7), (sh[0] + w * 0.16 + w * 0.2, sh[1] + 7), 1.2)
-        limb(main, sf, ef, hf, aw + 2, mid)
-        C(dark, ef, aw / 2 + 1, 1.2)
-        C(skin, hf, aw / 2 + 3)
-        C(dark, hf, aw / 2 + 3, 1.5)
+            obox(mid, (foot[0] + 4, foot[1] - 6), lw + 15, 13, 5)
+            line(plate_hi, (foot[0] - 3, foot[1] - 10), (foot[0] + 10, foot[1] - 10), 1.4)
+        obox(plate_lo, (head[0] - hr * 0.3, head[1] + hr * 1.0), hr * 1.5, 7, 3)             # gorget
+        hw_, hh_ = hr * 2 + 13, hr * 2 + 11
+        obox(skin, head, hw_, hh_, 6)                                                        # bucket great-helm
+        box(lerp_color(skin, WHITE, 0.3), (head[0] + 1, head[1] - hh_ * 0.36), hw_ - 4, hh_ * 0.2, 4)
+        poly(lerp_color(skin, INK, 0.3), [(head[0] - hw_ / 2 + 1, head[1] - hh_ * 0.24), (head[0] - hw_ * 0.2, head[1] - hh_ * 0.24),
+                                          (head[0] - hw_ * 0.2, head[1] + hh_ / 2 - 1), (head[0] - hw_ / 2 + 1, head[1] + hh_ / 2 - 1)])
+        box(INK, head, hw_, hh_, 6, 1.2)
+        line(INK, (head[0] - hw_ / 2, head[1] - hh_ * 0.25), (head[0] + hw_ / 2, head[1] - hh_ * 0.25), 1.2)
+        for rx in (-0.34, 0.0, 0.34):                                                        # rivets
+            C(INK, (head[0] + hw_ * rx, head[1] - hh_ * 0.37), 1.3)
+        vis = 0.8 + 0.2 * math.sin(t * 0.13) if not pained else 0.35 + 0.3 * (int(t) % 6 < 3)
+        vcol = lerp_color((20, 60, 80), acc, vis)
+        halo(acc, (head[0] + hr * 0.6, head[1] + 1), 13 + power * 0.1, int(140 * vis) + power)
+        vx0, vx1, vy_ = head[0] - hr * 0.15, head[0] + hw_ / 2 - 1, head[1] - 1
+        line(INK, (vx0 - 1, vy_), (vx1, vy_), 8)                                             # the T-shaped visor
+        line(INK, (head[0] + hr * 0.55, vy_), (head[0] + hr * 0.55, head[1] + hh_ * 0.38), 6.5)
+        line(vcol, (vx0, vy_), (vx1 - 1, vy_), 1.5 if blink else 5)
+        line(vcol, (head[0] + hr * 0.55, vy_), (head[0] + hr * 0.55, head[1] + hh_ * 0.34), 3.8)
+        line(WHITE, (vx0 + 3, vy_ - 1), (vx0 + 8, vy_ - 1), 1)
+        for k in (0.22, 0.34):                                                               # breath slits
+            line(INK, (head[0] - hr * 0.7, head[1] + hh_ * k), (head[0] - hr * 0.15, head[1] + hh_ * k), 1.3)
+        oC(main, (sh[0] + w * 0.17, sh[1] + 4), w * 0.27)                                    # front pauldron
+        line(INK, (sh[0] + w * 0.17 - w * 0.22, sh[1] + 8), (sh[0] + w * 0.17 + w * 0.22, sh[1] + 8), 1.2)
+        limb(main, sf, ef, hf, aw + 3, mid, aw + 3)                                          # near arm
+        oC(mid, ef, aw / 2 + 2.5, hl=False)
+        oC(main, hf, aw / 2 + 3.5)
         if weapon == 'maul':
             maul(hf, P['wp'])
         else:
             shield(hf, main)
 
     elif style == 'voidcaller':
-        # ---------------- NYX: hovering star-mage, layered robe, bent hat, star orb
+        # ---------------- NYX: hooded star-mage in a tattered cloak, floppy hat, dark star orb
         stars = [(math.cos(t * 0.06 + i * math.tau / 3), math.sin(t * 0.06 + i * math.tau / 3), i) for i in range(3)]
         hatc, hatband = col.get('hat', main), col.get('hatband', acc)
+        handc = lerp_color(main, WHITE, 0.35)
+        cloak_lo = lerp_color(dark, INK, 0.35)
 
         def swirl(j):                                                                         # ribbons of magic coil round her
             a0 = t * 0.055 + j * math.pi
-            pts = [(math.cos(a0 + q * 0.2) * w * (1.0 + q * 0.03), sh[1] + h * (0.16 + 0.36 * j) + math.sin(a0 + q * 0.2) * h * 0.12 - q * 1.4)
+            pts = [(math.cos(a0 + q * 0.2) * w * (1.05 + q * 0.03), sh[1] + h * (0.16 + 0.36 * j) + math.sin(a0 + q * 0.2) * h * 0.12 - q * 1.4)
                    for q in range(12)]
-            ribbon(pts, lerp_color(acc, dark, 0.25), 0, profile=lambda u: 3.4 * math.sin(math.pi * u) + 0.5)
-            ribbon(pts[2:10], lerp_color(acc, WHITE, 0.4), 0, profile=lambda u: 1.2 * math.sin(math.pi * u) + 0.3)
-
-        swirl(0)
+            ribbon(pts, lerp_color(acc, dark, 0.3), 0, profile=lambda u: 3.6 * math.sin(math.pi * u) + 0.5)
+            ribbon(pts[2:10], lerp_color(acc, WHITE, 0.4), 0, profile=lambda u: 1.3 * math.sin(math.pi * u) + 0.3)
+            for q in (1, 5, 9):
+                poly(WHITE, star_points(pts[q][0], pts[q][1] - 4, 2.2 + math.sin(t * 0.2 + q), t * 0.1))
 
         def orbit_star(cx_, sy_, i, size):
             for back in (2, 1):                                                               # fading trail
@@ -2242,75 +2325,79 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
             poly(acc, star_points(cx_ * w * 0.95, sh[1] + h * 0.25 + sy_ * 10, size, t * 0.05))
             C(WHITE, (cx_ * w * 0.95, sh[1] + h * 0.25 + sy_ * 10), 1.3)
 
-        for cx_, sy_, i in stars:
-            if sy_ < 0:
-                orbit_star(cx_, sy_, i, 5)
-
-        def sleeve(elbow, hand, c1, c2):
+        def sleeve(elbow, hand, c1):
             n = math.hypot(hand[0] - elbow[0], hand[1] - elbow[1]) or 1
             px, py = -(hand[1] - elbow[1]) / n, (hand[0] - elbow[0]) / n
             sag = 3 + math.sin(t * 0.1) * 1.5
-            pts = [elbow, (hand[0] + px * 10, hand[1] + py * 10 + sag), (hand[0] + px * 4 - 3, hand[1] + py * 4 + sag + 4),
-                   (hand[0], hand[1] + 1), (hand[0] - px * 5 - 3, hand[1] - py * 5 + 4), (hand[0] - px * 10, hand[1] - py * 10)]
-            poly(c1, pts)                                                                     # tattered cuff
+            opoly(c1, [elbow, (hand[0] + px * 11, hand[1] + py * 11 + sag), (hand[0] + px * 5 - 3, hand[1] + py * 5 + sag + 5),
+                       (hand[0], hand[1] + 1), (hand[0] - px * 5 - 3, hand[1] - py * 5 + 4), (hand[0] - px * 10, hand[1] - py * 10)])
+            line(lerp_color(c1, WHITE, 0.25), elbow, (hand[0] - px * 6, hand[1] - py * 6), 1.3)
 
-        limb(dark, sb, eb, hb_, aw)
-        sleeve(eb, hb_, mid, dark)
-        hang = chain('robe', (hip[0], hip[1]), 3, -hip[1] / 3, 0.9, 0.82, 0.3)                # the robe swings like a bell
+        swirl(0)
+        for cx_, sy_, i in stars:
+            if sy_ < 0:
+                orbit_star(cx_, sy_, i, 5)
+        limb(cloak_lo, sb, eb, hb_, aw + 1)
+        sleeve(eb, hb_, cloak_lo)
+        oC(lerp_color(handc, INK, 0.3), hb_, 3.6, hl=False)
+        hang = chain('robe', (hip[0], hip[1]), 3, -hip[1] / 3, 0.9, 0.82, 0.3)                # the cloak swings like a bell
         hx_, mx_ = hang[-1][0], hang[1][0]
+        cloth_strip('wisp', (hx_ - w * 0.3, hang[-1][1] - 8), 5, 7, cloak_lo, 13, 1.5, 0.25, 0.45, 0.6)   # trailing wisp
         rag = (0, -10, 3, -13, -1, -9, 4, -12, -2, -8, 1)                                    # a ragged, torn hem
-        hem = [(hx_ + (i / 10 - 0.5) * w * 1.5, hang[-1][1] + rag[i] + math.sin(t * 0.15 + i) * 2) for i in range(11)]
-        ribbon(chain('wisp', (hx_ - w * 0.3, hang[-1][1] - 8), 5, 7, 0.25, 0.9, 0.6, 0.45), dark, 13, 1)   # trailing wisp
-        poly(dark, [(sh[0] - tw / 2, sh[1]), (sh[0] + tw / 2, sh[1]), (mx_ + w * 0.5, hip[1] + 6)] + hem[::-1]
-             + [(mx_ - w * 0.5, hip[1] + 6)])
-        inner_y = hang[-1][1] - 16
-        poly(main, [(sh[0] - tw / 2 + 3, sh[1]), (sh[0] + tw / 2 - 3, sh[1]), (mx_ + w * 0.42, hip[1] + 4),
-                    (hx_ + w * 0.46, inner_y), (hx_ - w * 0.46, inner_y), (mx_ - w * 0.42, hip[1] + 4)])
-        poly(light, [(sh[0] + tw * 0.1, sh[1] + 2), (sh[0] + tw / 2 - 3, sh[1] + 2), (mx_ + w * 0.42, hip[1] + 4),
-                     (hx_ + w * 0.46, inner_y), (hx_ + w * 0.3, inner_y)])                    # lit front fold
-        line(acc, (hx_ - w * 0.46, inner_y), (hx_ + w * 0.46, inner_y), 2.5)
-        line(acc, (hip[0] - hw / 2, hip[1] - 4), (hip[0] + hw / 2, hip[1] - 2), 2.5)         # sash
-        ribbon(chain('nsash', (hip[0] - hw * 0.35, hip[1] - 2), 3, 7, 0.5, 0.86, 0.3), acc, 3.5, 1.5)
+        hem = [(hx_ + (i / 10 - 0.5) * w * 1.55, hang[-1][1] + rag[i] + math.sin(t * 0.15 + i) * 2) for i in range(11)]
+        opoly(dark, [(sh[0] - tw / 2, sh[1]), (sh[0] + tw / 2, sh[1]), (mx_ + w * 0.52, hip[1] + 6)] + hem[::-1]
+              + [(mx_ - w * 0.52, hip[1] + 6)])
+        inner_y = hang[-1][1] - 17
+        opoly(main, [(sh[0] - tw / 2 + 3, sh[1]), (sh[0] + tw / 2 - 3, sh[1]), (mx_ + w * 0.42, hip[1] + 4),
+                     (hx_ + w * 0.46, inner_y), (hx_ + w * 0.2, inner_y + 5), (hx_ - w * 0.1, inner_y - 2),
+                     (hx_ - w * 0.46, inner_y + 3), (mx_ - w * 0.42, hip[1] + 4)], 0.9)
+        poly(light, [(sh[0] + tw * 0.12, sh[1] + 2), (sh[0] + tw / 2 - 4, sh[1] + 2), (mx_ + w * 0.4, hip[1] + 4),
+                     (hx_ + w * 0.44, inner_y - 1), (hx_ + w * 0.3, inner_y)])               # lit front fold
+        for fx_ in (-0.22, 0.05):                                                            # folds
+            line(dark, (sh[0] + fx_ * w, sh[1] + 10), (hx_ + fx_ * w * 1.4, inner_y - 3), 1.2)
+        line(lerp_color(acc, dark, 0.4), (hip[0] - hw / 2, hip[1] - 4), (hip[0] + hw / 2, hip[1] - 2), 2.2)   # cord
         for k, (ax, ay) in enumerate(((0.2, 0.3), (-0.25, 0.55), (0.3, 0.75), (-0.1, 0.42))):
-            tw_ = 0.6 + 0.4 * math.sin(t * 0.12 + k * 2)                                      # twinkling robe stars
+            tw_ = 0.6 + 0.4 * math.sin(t * 0.12 + k * 2)                                      # twinkling stars in the cloth
             poly(lerp_color(main, WHITE, tw_), star_points(sh[0] + ax * w * 0.6 + (hx_ - sh[0]) * ay,
-                 sh[1] + (inner_y - sh[1]) * ay, 2 + tw_ * 1.5, t * 0.03))
-        poly(dark, [(head[0] - hr * 1.2, head[1] + hr * 0.3), (head[0] - hr * 0.95, head[1] - hr * 0.6),
-                    (head[0] + hr * 0.7, head[1] - hr * 0.7), (head[0] + hr * 1.1, head[1] + hr * 0.5),
-                    (sh[0] + tw / 2 + 3, sh[1] + 5), (sh[0] + 2, sh[1] + 9), (sh[0] - tw / 2 - 4, sh[1] + 6)])    # hood and mantle
-        C(skin, (head[0] + hr * 0.1, head[1] + hr * 0.1), hr * 0.92)                         # the void where a face should be
-        eye_y = head[1] + hr * 0.38
-        for ex in (0.2, 0.62):
-            halo(acc, (head[0] + hr * ex, eye_y), 7, 170)
+                 sh[1] + (inner_y - sh[1]) * ay, 1.8 + tw_ * 1.4, t * 0.03))
+        opoly(dark, [(head[0] - hr * 1.25, head[1] + hr * 0.4), (head[0] - hr * 1.0, head[1] - hr * 0.6),
+                     (head[0] + hr * 0.75, head[1] - hr * 0.7), (head[0] + hr * 1.15, head[1] + hr * 0.6),
+                     (sh[0] + tw / 2 + 4, sh[1] + 6), (sh[0] + 3, sh[1] + 11), (sh[0] - tw / 2 - 5, sh[1] + 7)])   # hood and mantle
+        poly(main, [(head[0] + hr * 0.75, head[1] - hr * 0.7), (head[0] + hr * 1.15, head[1] + hr * 0.6),
+                    (sh[0] + tw / 2 + 4, sh[1] + 6), (head[0] + hr * 0.7, head[1] + hr * 0.9)])
+        C(skin, (head[0] + hr * 0.1, head[1] + hr * 0.12), hr * 0.9)                         # the void where a face should be
+        eye_y = head[1] + hr * 0.36
+        for ex in (0.16, 0.62):
+            ex_ = head[0] + hr * ex
+            halo(acc, (ex_, eye_y), 7, 170)
             if blink or pained:
-                line(acc, (head[0] + hr * ex - 3, eye_y), (head[0] + hr * ex + 3, eye_y), 1.5)
+                line(acc, (ex_ - 3, eye_y), (ex_ + 3, eye_y), 1.5)
             else:
-                ex_ = head[0] + hr * ex
                 poly(acc, [(ex_ - 3.4, eye_y - 0.5), (ex_ + 3.6, eye_y - 2.8), (ex_ + 2.8, eye_y + 3.2)])   # slanted glare
                 C(WHITE, (ex_ + 1.3, eye_y), 1)
-        oval(hatc, (head[0], head[1] - hr * 0.45), hr * 3.7, hr * 1.05)
-        oval(lerp_color(hatc, WHITE, 0.2), (head[0] + hr * 0.5, head[1] - hr * 0.5), hr * 2.2, hr * 0.5)
-        oval(dark, (head[0], head[1] - hr * 0.45), hr * 3.7, hr * 1.05, 1.5)
-        cone = chain('hat', (head[0], head[1] - hr * 1.2), 3, hr * 0.62, -0.5, 0.84, 0.25)    # the bent tip sways
-        base_l, base_r = (head[0] - hr * 0.95, head[1] - hr * 0.5), (head[0] + hr * 0.95, head[1] - hr * 0.5)
-        poly(hatc, [base_l, base_r, (cone[1][0] + 5, cone[1][1]), (cone[2][0] + 2.5, cone[2][1]), cone[3],
-                    (cone[2][0] - 2.5, cone[2][1]), (cone[1][0] - 5, cone[1][1])])
-        poly(lerp_color(hatc, WHITE, 0.22), [base_r, (head[0] + hr * 0.3, head[1] - hr * 0.5), (cone[1][0] + 1, cone[1][1]), (cone[1][0] + 5, cone[1][1])])
-        line(hatband, (head[0] - hr * 0.95, head[1] - hr * 0.6), (head[0] + hr * 0.95, head[1] - hr * 0.6), 4)
-        charm = chain('charm', cone[3], 2, 5, 0.6, 0.9, 0.2)
-        line(acc, charm[0], charm[2], 1)
-        poly(acc, star_points(charm[2][0], charm[2][1] + 2, 4.5, t * 0.1))
-        limb(dark, sf, ef, hf, aw)
-        sleeve(ef, hf, main, acc)
-        C(skin, hf, 4)
+        ooval(hatc, (head[0], head[1] - hr * 0.5), hr * 4.0, hr * 1.15)                      # wide floppy brim
+        oval(lerp_color(hatc, WHITE, 0.22), (head[0] + hr * 0.5, head[1] - hr * 0.62), hr * 2.3, hr * 0.42)
+        oval(lerp_color(hatc, INK, 0.35), (head[0] - hr * 0.2, head[1] - hr * 0.3), hr * 3.0, hr * 0.4)
+        cone = chain('hat', (head[0], head[1] - hr * 1.25), 3, hr * 0.7, -0.5, 0.84, 0.25)    # the bent tip sways
+        base_l, base_r = (head[0] - hr * 1.0, head[1] - hr * 0.55), (head[0] + hr * 1.0, head[1] - hr * 0.55)
+        opoly(hatc, [base_l, base_r, (cone[1][0] + 6, cone[1][1]), (cone[2][0] + 3, cone[2][1]), cone[3],
+                     (cone[2][0] - 3, cone[2][1]), (cone[1][0] - 6, cone[1][1])])
+        poly(lerp_color(hatc, WHITE, 0.24), [base_r, (head[0] + hr * 0.3, head[1] - hr * 0.55), (cone[1][0] + 1, cone[1][1]), (cone[1][0] + 5, cone[1][1])])
+        poly(lerp_color(hatc, INK, 0.3), [base_l, (head[0] - hr * 0.4, head[1] - hr * 0.55), (cone[1][0] - 2, cone[1][1]), (cone[1][0] - 5.5, cone[1][1])])
+        line(INK, (head[0] - hr * 1.0, head[1] - hr * 0.66), (head[0] + hr * 1.0, head[1] - hr * 0.66), 5.5)
+        line(hatband, (head[0] - hr * 0.97, head[1] - hr * 0.66), (head[0] + hr * 0.97, head[1] - hr * 0.66), 3.6)
+        limb(dark, sf, ef, hf, aw + 1)
+        sleeve(ef, hf, main)
+        oC(handc, hf, 4, hl=False)
         orb = P.get('orb', hf)
         if math.hypot(orb[0] - hf[0], orb[1] - hf[1]) > 16:
             line(acc, hf, orb, 1)
         pulse = 1 + 0.15 * math.sin(t * 0.2)
-        halo(acc, orb, 19 * pulse, 170)
-        C((26, 14, 46), orb, 10.5 * pulse)                                                   # a dark sphere holding a star
-        C((70, 40, 110), (orb[0] - 2.5, orb[1] - 3), 4 * pulse)
-        C(acc, orb, 10.5 * pulse, 1.6)
+        halo(acc, orb, 20 * pulse, 170)
+        C(INK, orb, 11.5 * pulse)
+        C((30, 16, 52), orb, 10.5 * pulse)                                                   # a dark sphere holding a star
+        C((74, 42, 116), (orb[0] - 2.5, orb[1] - 3), 4.2 * pulse)
+        C(acc, orb, 10.5 * pulse, 1.5)
         poly(acc, star_points(orb[0], orb[1], 7 * pulse, t * 0.1))
         C(WHITE, orb, 1.6)
         for i in range(3):                                                                    # sparks circling the orb
@@ -2322,97 +2409,90 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
                 orbit_star(cx_, sy_, i, 6)
 
     else:
-        # ---------------- RHEA: brawler, living flame hair, heavy gauntlets, baggy trousers
+        # ---------------- RHEA: brawler with a mane of fire, burning cloth-bound fists, torn clothes
         hot = info.get('hot', False)
-        fire = (col.get('flame', (240, 92, 24)), acc, (255, 250, 228))
-        shade = lerp_color(skin, dark, 0.35)
-        front_leg = lerp_color(dark, main, 0.45)
+        fire = (col.get('flame', (240, 92, 24)), lerp_color(col.get('flame', (240, 92, 24)), acc, 0.6), acc, (255, 250, 228))
+        shade = lerp_color(skin, dark, 0.38)
+        pants, pants_lo = lerp_color(dark, main, 0.45), lerp_color(dark, INK, 0.2)
         bandc, wrapc = col.get('band', dark), col.get('wrap', acc)
+        wrap_lo = lerp_color(wrapc, INK, 0.35)
 
         def leg2(a, j, b, color):
-            limb(color, a, j, b, lw + 4, color, lw)
-            for k in (0.72, 0.86):                                                            # ankle wraps
-                q = (j[0] + (b[0] - j[0]) * k, j[1] + (b[1] - j[1]) * k)
-                line(wrapc, (q[0] - lw / 2, q[1]), (q[0] + lw / 2, q[1]), 2.2)
-            poly(color, [(j[0] + (b[0] - j[0]) * 0.55 - lw / 2 - 1, j[1] + (b[1] - j[1]) * 0.55), (j[0] + (b[0] - j[0]) * 0.55 + lw / 2 + 1, j[1] + (b[1] - j[1]) * 0.55),
-                         (j[0] + (b[0] - j[0]) * 0.7 + 2, j[1] + (b[1] - j[1]) * 0.7), (j[0] + (b[0] - j[0]) * 0.62, j[1] + (b[1] - j[1]) * 0.62),
-                         (j[0] + (b[0] - j[0]) * 0.72 - 3, j[1] + (b[1] - j[1]) * 0.72)])      # torn trouser cuff
-            oval(skin, (b[0] + 3, b[1] - 3), 12, 8)
+            limb(color, a, j, b, lw + 4, color, lw + 1)
+            sx_, sy_ = b[0] - j[0], b[1] - j[1]
+            opoly(color, [(j[0] + sx_ * 0.5 - lw / 2 - 2, j[1] + sy_ * 0.5), (j[0] + sx_ * 0.5 + lw / 2 + 2, j[1] + sy_ * 0.5),
+                          (j[0] + sx_ * 0.7 + 3, j[1] + sy_ * 0.7), (j[0] + sx_ * 0.6, j[1] + sy_ * 0.6),
+                          (j[0] + sx_ * 0.74 - 3, j[1] + sy_ * 0.74)], 0.9)                   # torn trouser cuff
+            bands(j, b, wrapc, (0.8, 0.92), lw / 2 + 0.5, 2.2)
+            ooval(skin, (b[0] + 3, b[1] - 3), 12, 7)
             line(wrapc, (b[0] - 1, b[1] - 5), (b[0] + 6, b[1] - 4), 2)
+            if hot:                                                                           # fire licks round her feet
+                flame_strand(chain('foot%d' % (a is hpf), (b[0] - 4, b[1] - 1), 4, 5, -0.5, 0.78, 0.9), 9, fire, 5.0)
 
-        def gauntlet(elbow, hand, color, name):
+        def fist(elbow, hand, color, name):
             n = math.hypot(hand[0] - elbow[0], hand[1] - elbow[1]) or 1
             ux, uy = (hand[0] - elbow[0]) / n, (hand[1] - elbow[1]) / n
             if hot:
-                halo(acc, hand, 22, 170)
-            flame_strand(chain(name, (hand[0] - ux * 2, hand[1] - uy * 2), 5, 6.5 if hot else 4.5, -0.55, 0.78, 0.9),
-                         15 if hot else 9.5, fire, 3.0)                                       # her fists always burn
-            C(color, hand, aw / 2 + 3.5)                                                      # bare fist, bound in cloth
-            for k in (-3.5, -0.5, 2.5):
-                line(wrapc, (hand[0] + ux * k - uy * 5, hand[1] + uy * k + ux * 5),
-                     (hand[0] + ux * k + uy * 5, hand[1] + uy * k - ux * 5), 1.8)
-            for k in (0.45, 0.7):                                                             # forearm wraps
-                q = (elbow[0] + (hand[0] - elbow[0]) * k, elbow[1] + (hand[1] - elbow[1]) * k)
-                line(wrapc, (q[0] - uy * 4, q[1] + ux * 4), (q[0] + uy * 4, q[1] - ux * 4), 1.8)
+                halo(acc, hand, 24, 170)
+            flame_strand(chain(name, (hand[0] - ux * 2, hand[1] - uy * 2), 6, 7 if hot else 5, -0.55, 0.78, 0.9),
+                         17 if hot else 11, fire, 3.0)                                        # her fists always burn
+            oC(color, hand, aw / 2 + 3.6, hl=False)
+            bands((hand[0] - ux * 4, hand[1] - uy * 4), (hand[0] + ux * 4, hand[1] + uy * 4), wrapc, (0.1, 0.5, 0.9), 5, 1.8)
+            bands(elbow, hand, wrapc, (0.45, 0.62, 0.78), aw / 2 + 0.5, 1.9)
+            bands(elbow, hand, wrap_lo, (0.53, 0.7), aw / 2 + 0.5, 0.9)
 
-        limb(shade, sb, eb, hb_, aw)
-        gauntlet(eb, hb_, shade, 'fistb')
-        leg2(hpb, kb, fb, dark)
-        ribbon(chain('band1', (head[0] - hr * 0.95, head[1] - hr * 0.3), 6, 6, 0.2, 0.9, 0.5, 0.4), bandc, 5.5, 2)
-        ribbon(chain('band2', (head[0] - hr * 0.95, head[1] - hr * 0.2), 5, 6, 0.26, 0.9, 0.5, 0.4), lerp_color(bandc, (0, 0, 0), 0.3), 5, 2)
-        torso(skin, tw, hw)
-        line(shade, (hip[0] + 1, hip[1] - 9), (hip[0] + 1, hip[1] - 2), 1.5)                 # abs
-        line(shade, (hip[0] - 4, hip[1] - 6), (hip[0] + 6, hip[1] - 6), 1.5)
-        k = 0.55
-        poly(main, [(sh[0] - tw / 2, sh[1]), (sh[0] + tw / 2, sh[1]),
-                    (sh[0] + tw / 2 + (hip[0] + hw / 2 - sh[0] - tw / 2) * k, sh[1] + (hip[1] - sh[1]) * k),
-                    (sh[0] - tw / 2 + (hip[0] - hw / 2 - sh[0] + tw / 2) * k, sh[1] + (hip[1] - sh[1]) * k)])
-        poly(mid, [(sh[0] - tw / 2, sh[1]), (sh[0] - tw * 0.12, sh[1]),
-                   (sh[0] - tw * 0.16 + (hip[0] - sh[0]) * k, sh[1] + (hip[1] - sh[1]) * k),
-                   (sh[0] - tw / 2 + (hip[0] - hw / 2 - sh[0] + tw / 2) * k, sh[1] + (hip[1] - sh[1]) * k)])
-        yb = sh[1] + (hip[1] - sh[1]) * k                                                    # torn hem of her top
-        for i in range(4):
-            xb = sh[0] - tw * 0.42 + i * tw * 0.26
-            poly(main if i else mid, [(xb - 1, yb - 1), (xb + tw * 0.24, yb - 1), (xb + tw * 0.1, yb + 4 + (i % 2) * 2)])
-        line(lerp_color(main, WHITE, 0.3), (sh[0] - tw * 0.1, sh[1] + 1.5), (sh[0] + tw * 0.45, sh[1] + 1.5), 1.5)
-        line(bandc, (hip[0] - hw / 2, hip[1]), (hip[0] + hw / 2, hip[1]), 5)                 # cloth belt
-        ribbon(chain('rsash', (hip[0] - hw * 0.4, hip[1] + 2), 4, 7, 0.5, 0.86, 0.3), bandc, 5, 2)
-        leg2(hpf, kf, ff, front_leg)
-        # the mane: five strands of fire, each a simulated rope that rises instead of hanging
+        limb(shade, sb, eb, hb_, aw + 1)                                                     # far arm
+        fist(eb, hb_, shade, 'fistb')
+        leg2(hpb, kb, fb, pants_lo)
+        cloth_strip('band2', (head[0] - hr * 0.95, head[1] - hr * 0.2), 5, 6, lerp_color(bandc, INK, 0.3), 5.5, 2.5, 0.26, 0.4)
+        cloth_strip('band1', (head[0] - hr * 0.95, head[1] - hr * 0.3), 6, 6, bandc, 6, 2.5, 0.2, 0.4)
+        torso(skin, tw, hw, 4, shade)
+        line(shade, (hip[0] + 1, hip[1] - 9), (hip[0] + 1, hip[1] - 2), 1.3)                 # abs
+        line(shade, (hip[0] - 4, hip[1] - 6), (hip[0] + 6, hip[1] - 6), 1.3)
+        k = 0.6
+        yb = sh[1] + (hip[1] - sh[1]) * k
+        xl = sh[0] - tw / 2 + (hip[0] - hw / 2 - sh[0] + tw / 2) * k
+        xr = sh[0] + tw / 2 + (hip[0] + hw / 2 - sh[0] - tw / 2) * k
+        top = torso_pts(tw, hw)[:4] + [(xr, yb), (xr - (xr - xl) * 0.2, yb + 4), (xr - (xr - xl) * 0.4, yb - 1),
+                                       (xr - (xr - xl) * 0.6, yb + 5), (xr - (xr - xl) * 0.8, yb), (xl, yb + 3)]
+        opoly(main, top)                                                                     # torn sleeveless top
+        poly(mid, [top[0], top[1], (sh[0] - tw * 0.14, sh[1] - 1), (xl + (xr - xl) * 0.3, yb), (xl, yb + 3)])
+        line(light, (sh[0], sh[1] + 1.5), (sh[0] + tw * 0.4, sh[1] + 1.5), 1.5)
+        line(mid, (sh[0] + tw * 0.2, sh[1] + 4), (sh[0] + tw * 0.1, yb - 3), 1.1)
+        line(INK, (hip[0] - hw / 2 - 1, hip[1]), (hip[0] + hw / 2 + 1, hip[1]), 7)
+        line(bandc, (hip[0] - hw / 2, hip[1]), (hip[0] + hw / 2, hip[1]), 4.6)               # cloth belt
+        cloth_strip('rsash', (hip[0] - hw * 0.4, hip[1] + 2), 4, 7, bandc, 5.5, 2.5, 0.5, 0.2, 0.3)
+        leg2(hpf, kf, ff, pants)
+        # the mane: seven strands of fire, each a simulated rope that rises instead of hanging
         grow = 1.3 if hot else 1.0
-        halo(fire[0], (head[0] - 2, head[1] - hr * 1.5), hr * 2.6 * grow, 90)
-        for i, (off, n_, wd) in enumerate(((-1.15, 6, 14), (0.95, 6, 13), (-0.75, 7, 17), (0.6, 7, 16),
-                                           (-0.38, 8, 20), (0.25, 9, 20), (-0.06, 10, 23))):
-            base = (head[0] + off * hr * 0.85 - 2, head[1] - hr * (0.55 + 0.3 * (1 - abs(off))))
-            pts = chain('mane%d' % i, base, n_, hr * 0.46 * grow, -0.62, 0.76, 1.0)
+        halo(fire[0], (head[0] - 2, head[1] - hr * 1.6), hr * 3.0 * grow, 90)
+        for i, (off, n_, wd) in enumerate(((-1.3, 7, 17), (1.15, 7, 16), (-0.9, 8, 21), (0.75, 8, 20),
+                                           (-0.45, 9, 25), (0.32, 9, 25), (-0.06, 11, 29))):
+            base = (head[0] + off * hr * 0.9 - 2, head[1] - hr * (0.5 + 0.35 * (1 - abs(off) / 1.25)))
+            pts = chain('mane%d' % i, base, n_, hr * 0.5 * grow, -0.5, 0.78, 1.3, 0.14 - off * 0.55)
             flame_strand(pts, wd * grow, fire, i * 1.7)
-        C(skin, head, hr)
-        poly(fire[0], [(head[0] - hr * 0.98, head[1] - hr * 0.2), (head[0] - hr * 0.5, head[1] - hr * 1.05),
-                       (head[0] + hr * 0.75, head[1] - hr * 0.9), (head[0] + hr * 0.95, head[1] - hr * 0.42)])   # hairline
-        line(bandc, (head[0] - hr, head[1] - hr * 0.3), (head[0] + hr, head[1] - hr * 0.38), 5)
-        line(lerp_color(bandc, WHITE, 0.3), (head[0] - hr * 0.7, head[1] - hr * 0.4), (head[0] + hr * 0.9, head[1] - hr * 0.46), 1)
-        line(shade, (head[0] + hr * 0.1, head[1] + hr * 0.4), (head[0] + hr * 0.4, head[1] + hr * 0.28), 1.2)   # scar
-        human_eye((head[0] + hr * 0.5, head[1] + hr * 0.1), hr * 0.19)
-        if not pained:
-            line(ink, (head[0] + hr * 0.15, head[1] - hr * 0.2), (head[0] + hr * 0.85, head[1] - hr * 0.02), 2)   # fierce brow
-        if striking or pained:
-            oval(ink, (head[0] + hr * 0.5, head[1] + hr * 0.58), 5, 4)                       # shout
-        else:
-            line(ink, (head[0] + hr * 0.3, head[1] + hr * 0.5), (head[0] + hr * 0.7, head[1] + hr * 0.58), 1.2)   # smirk
-        limb(skin, sf, ef, hf, aw)
+        face(0.23, 2.0, scar=True)
+        poly(fire[1], [(head[0] - hr * 0.95, head[1] - hr * 0.2), (head[0] - hr * 0.55, head[1] - hr * 1.0),
+                       (head[0] + hr * 0.8, head[1] - hr * 0.86), (head[0] + hr * 1.0, head[1] - hr * 0.4)])   # hairline
+        line(INK, (head[0] - hr * 1.02, head[1] - hr * 0.3), (head[0] + hr * 1.04, head[1] - hr * 0.4), 6.6)
+        line(bandc, (head[0] - hr, head[1] - hr * 0.3), (head[0] + hr * 1.02, head[1] - hr * 0.4), 4.6)
+        line(lerp_color(bandc, WHITE, 0.3), (head[0] - hr * 0.7, head[1] - hr * 0.42), (head[0] + hr * 0.9, head[1] - hr * 0.5), 1)
+        limb(skin, sf, ef, hf, aw + 1)                                                       # near arm
         line(shade, (sf[0] + (ef[0] - sf[0]) * 0.4 - 2, sf[1] + (ef[1] - sf[1]) * 0.4 - 1),
-             (sf[0] + (ef[0] - sf[0]) * 0.6 + 2, sf[1] + (ef[1] - sf[1]) * 0.6 + 1), 1.2)     # scar
-        gauntlet(ef, hf, skin, 'fistf')
+             (sf[0] + (ef[0] - sf[0]) * 0.6 + 2, sf[1] + (ef[1] - sf[1]) * 0.6 + 1), 1.2)    # scar
+        fist(ef, hf, skin, 'fistf')
 
-    pts = pygame.mask.from_surface(s, 200).outline(3)         # dark ink line around the silhouette
+    pts = pygame.mask.from_surface(s, 200).outline(3)         # a heavier ink line round the whole silhouette
     if len(pts) > 2:
-        D.lines(s, OUTLINE, True, pts, 2 * SS)
+        D.lines(s, INK, True, pts, 2 * SS)
     return pygame.transform.smoothscale(s, (SPR, SPR))
 
 
-def quick_sprite(spec, col, key, facing, t):
-    """A fighter in a named pose with no blending (menus, result screen)."""
-    return render_fighter_surface(spec, col, target_pose(spec, key, t), facing, t, key)
+def quick_sprite(spec, col, key, facing, t, zoom=1.5):
+    """A fighter in a named pose with no blending, enlarged with crisp pixels (menus, result screen)."""
+    spr = render_fighter_surface(spec, col, target_pose(spec, key, t), facing, t, key)
+    small = pygame.transform.smoothscale(spr, (int(SPR * zoom / PIXEL), int(SPR * zoom / PIXEL)))
+    return pygame.transform.scale(small, (int(SPR * zoom), int(SPR * zoom)))
 
 
 # ---------------------------------------------------------------------
@@ -3446,9 +3526,9 @@ class GameManager:
         if not pts:
             pts = [self.map_data.respawn]
         pts.append((WORLD_W / 2, self.map_data.top - 120))
-        x0, x1 = min(p[0] for p in pts) - 300, max(p[0] for p in pts) + 300
-        y0, y1 = min(p[1] for p in pts) - 240, max(p[1] for p in pts) + 220
-        w = clamp(max(x1 - x0, (y1 - y0) * 16 / 9, 1050), 1050, WORLD_W)
+        x0, x1 = min(p[0] for p in pts) - 250, max(p[0] for p in pts) + 250
+        y0, y1 = min(p[1] for p in pts) - 210, max(p[1] for p in pts) + 190
+        w = clamp(max(x1 - x0, (y1 - y0) * 16 / 9, 860), 860, WORLD_W)
         tx, ty = (x0 + x1) / 2 - w / 2, (y0 + y1) / 2 - w * 9 / 32
         for i, target in enumerate((tx, ty, w)):
             self.camf[i] += (target - self.camf[i]) * 0.08
@@ -3527,7 +3607,11 @@ class GameManager:
             view.move_ip(random.randint(-self.fx.shake, self.fx.shake), random.randint(-self.fx.shake, self.fx.shake))
             view.clamp_ip(pygame.Rect(0, 0, WORLD_W, WORLD_H))
         self._draw_world(view)
-        pygame.transform.smoothscale(self.world.subsurface(view), (SCREEN_WIDTH, SCREEN_HEIGHT), self.screen)
+        # fine-pixel finish: shrink the view to a 640x360 grid, then double every pixel
+        if not hasattr(self, 'lowres'):
+            self.lowres = pygame.Surface((SCREEN_WIDTH // PIXEL, SCREEN_HEIGHT // PIXEL)).convert()
+        pygame.transform.smoothscale(self.world.subsurface(view), self.lowres.get_size(), self.lowres)
+        pygame.transform.scale(self.lowres, (SCREEN_WIDTH, SCREEN_HEIGHT), self.screen)
         self._render_hud(view)
         if scene == 'RESULT':
             self._render_result()
@@ -3654,7 +3738,6 @@ class GameManager:
         for i, spec in enumerate(ROSTER):                            # the cast idles along the bottom
             x = (110, 310, 970, 1170)[i]
             spr = quick_sprite(spec, spec['colors'], 'idle', 1 if i < 2 else -1, t + i * 37)
-            spr = pygame.transform.scale(spr, (SPR * 3 // 2, SPR * 3 // 2))
             scr.blit(spr, (x - SPR_CX * 3 // 2, 620 - SPR_FEET * 3 // 2))
             self.text(scr, spec['name'].upper(), 26, spec['colors']['accent'], (x, 644))
         scr.blit(self.logo, self.logo.get_rect(center=(SCREEN_WIDTH // 2, 110)))
@@ -3762,7 +3845,6 @@ class GameManager:
             self.text(scr, f"PLAYER {slot + 1}  -  {who}", 26, PLAYER_TAGS[slot], (card.x + 18, card.y + 12), 'topleft')
             pose = 'run' if (t // 180) % 2 else 'idle'
             spr = quick_sprite(spec, col, pose, 1 if slot == 0 else -1, t)
-            spr = pygame.transform.scale(spr, (SPR * 3 // 2, SPR * 3 // 2))
             scr.blit(spr, (card.x + 110 - SPR_CX * 3 // 2, card.y + 238 - SPR_FEET * 3 // 2))
             tx = card.x + 210
             self.text(scr, f"<  {spec['name'].upper()}  >", 46, WHITE, (tx, card.y + 46), 'topleft')
@@ -3812,8 +3894,8 @@ class GameManager:
         scr.blit(dim, (0, 0))
         w = self.winner
         if w:
-            spr = quick_sprite(w.spec, w.colors, 'parry', 1, self.frame)
-            scr.blit(pygame.transform.scale(spr, (SPR * 2, SPR * 2)), (SCREEN_WIDTH // 2 - SPR_CX * 2, 640 - SPR_FEET * 2))
+            spr = quick_sprite(w.spec, w.colors, 'parry', 1, self.frame, 2)
+            scr.blit(spr, (SCREEN_WIDTH // 2 - SPR_CX * 2, 640 - SPR_FEET * 2))
             self.text(scr, f"{w.player_name} WINS!", 110, w.colors['accent'], (SCREEN_WIDTH // 2, 100))
             self.text(scr, f"{w.name}, {w.spec['title']}  -  {w.current_lives} lives left", 30, WHITE, (SCREEN_WIDTH // 2, 170))
         else:
