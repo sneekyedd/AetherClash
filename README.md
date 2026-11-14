@@ -64,5 +64,14 @@ pairs two players (`python aether_server.py`).
 
 ## Custom art
 
-Put PNGs in an `assets/` folder next to the script and they replace the placeholder drawings:
-`kai_idle.png`, `bronn_attack.png`, ... (poses: idle, run, jump, fall, attack, hurt, stun, shield, parry, dodge, ledge, helpless; drawn facing right) and `bg_atoll.png`, `bg_loom.png`, `bg_crucible.png` (2400x1400).
+Real artwork replaces the code-drawn fighters automatically. Put PNGs in an `assets` folder next to the game:
+
+- `assets/kai/idle.png` for a single still image of a pose, or `assets/kai/run_1.png`, `run_2.png`, ... for an
+  animation (frames play in number order).
+- Poses: `idle`, `run`, `jump`, `fall`, `attack`, `hurt`, `stun`, `shield`, `parry`, `dodge`, `ledge`, `grab`,
+  `grabbed`, `helpless`. Missing poses borrow the nearest one, so `idle` alone is enough to start.
+- Draw the fighter facing right on a transparent background, with the feet touching the bottom edge and every
+  frame the same size.
+- Optional `assets/kai/sprite.json`: `{"height": 130, "fps": 10}` sets the on-screen height in pixels and the
+  animation speed.
+- Stage backgrounds: `assets/bg_atoll.png`, `bg_loom.png`, `bg_crucible.png` (2400x1400).

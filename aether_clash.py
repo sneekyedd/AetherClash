@@ -2755,12 +2755,29 @@ def draw_projectile(surf, p, frame):
         pygame.draw.circle(surf, (10, 4, 24), (x, y), 12)
 
 
+SPRITE_POSES = ('idle', 'run', 'jump', 'fall', 'attack', 'hurt', 'stun', 'shield', 'parry', 'dodge', 'ledge',
+                'grab', 'grabbed', 'helpless', 'gun')
+# if a pose has no artwork, borrow the closest one that does (and finally 'idle')
+SPRITE_FALLBACK = dict(fall='jump', helpless='fall', parry='shield', grabbed='hurt', stun='hurt', gun='attack',
+                       grab='attack', dodge='run', ledge='jump', shield='idle', hurt='idle', jump='idle', run='idle',
+                       attack='idle')
+
+
 class AssetLibrary:
-    """PHASE 3 hook. Drop PNGs into ./assets and they replace the placeholder art automatically:
-       <fighter>_<pose>.png (e.g. kai_idle.png, bronn_attack.png; drawn facing right) and bg_<stage>.png."""
+    """Loads real artwork from the ./assets folder (next to the .exe when packaged). All of it is optional.
+
+    Fighters:  assets/<fighter>/<pose>.png            one still image for a pose, or
+               assets/<fighter>/<pose>_1.png, _2 ...  numbered frames, played as an animation
+               (poses: idle run jump fall attack hurt stun shield parry dodge ledge grab grabbed helpless;
+                draw the fighter facing right, on a transparent background, feet on the bottom edge)
+               assets/<fighter>/sprite.json           optional {"height": 130, "fps": 10}
+    Stages:    assets/bg_<stage>.png                  2400x1400 background (atoll, loom, crucible)
+
+    A fighter with any artwork is drawn entirely from it; missing poses borrow the nearest one."""
+
     def __init__(self):
-        self.dir = os.path.join(app_dir(), 'assets')        # next to the .exe when packaged
-        self.cache = {}
+        self.dir = os.environ.get('AETHER_CLASH_ASSETS') or os.path.join(app_dir(), 'assets')
+        self.cache, self.sets, self.scaled = {}, {}, {}
 
     def get(self, name):
         if name not in self.cache:
@@ -2770,6 +2787,59 @@ class AssetLibrary:
             except pygame.error:
                 self.cache[name] = None
         return self.cache[name]
+
+    def fighter(self, name):
+        """Returns dict(frames={pose: [images]}, height=..., fps=...) or None if there is no art for this fighter."""
+        if name not in self.sets:
+            folder, found, cfg = os.path.join(self.dir, name), [], {}
+            if os.path.isdir(folder):
+                for fn in os.listdir(folder):
+                    stem, ext = os.path.splitext(fn)
+                    if ext.lower() != '.png':
+                        continue
+                    pose, _, idx = stem.rpartition('_')
+                    pose, idx = (pose, int(idx)) if (idx.isdigit() and pose) else (stem, 0)
+                    try:
+                        found.append((pose.lower(), idx, pygame.image.load(os.path.join(folder, fn)).convert_alpha()))
+                    except pygame.error:
+                        pass
+                try:
+                    with open(os.path.join(folder, 'sprite.json'), encoding='utf-8') as fh:
+                        cfg = json.load(fh)
+                except (OSError, ValueError):
+                    pass
+            for pose in SPRITE_POSES:                         # older flat naming: assets/kai_idle.png
+                img = self.get(f"{name}_{pose}")
+                if img:
+                    found.append((pose, 0, img))
+            frames = {}
+            for pose, _, img in sorted(found, key=lambda f: (f[0], f[1])):
+                frames.setdefault(pose, []).append(img)
+            self.sets[name] = dict(frames=frames, height=cfg.get('height'), fps=cfg.get('fps', 10)) if frames else None
+        return self.sets[name]
+
+    def frame(self, name, pose, tick, progress, target_height, facing):
+        """The image to show right now, scaled and flipped, or None."""
+        art = self.fighter(name)
+        if not art:
+            return None
+        frames, seen = art['frames'], set()
+        while pose not in frames and pose in SPRITE_FALLBACK and pose not in seen:
+            seen.add(pose)
+            pose = SPRITE_FALLBACK[pose]
+        seq = frames.get(pose) or frames.get('idle') or next(iter(frames.values()))
+        if progress is not None:                              # attacks play once, in step with the move
+            i = min(len(seq) - 1, int(progress * len(seq)))
+        else:
+            i = int(tick * art['fps'] / FPS) % len(seq)
+        ref = (frames.get('idle') or seq)[0]
+        k = (art['height'] or target_height) / ref.get_height()      # one scale for every frame of this fighter
+        key = (id(seq[i]), facing, round(k, 3))
+        if key not in self.scaled:
+            img = seq[i]
+            img = pygame.transform.smoothscale(img, (max(1, int(img.get_width() * k)), max(1, int(img.get_height() * k))))
+            self.scaled[key] = img if facing > 0 else pygame.transform.flip(img, True, False)
+        return self.scaled[key]
 
 
 # =====================================================================
@@ -2855,10 +2925,10 @@ class StateTranslator:
         target = target_pose(c.spec, key, c.anim, info)
         rate = 0.8 if info.get('phase') == 'strike' else 0.42
         c.pose = target if c.pose is None else blend_pose(c.pose, target, rate)
-        img = self.assets.get(f"{c.name.lower()}_{key}")
-        if img:
+        progress = c.move_frame / max(1, c.current_move.duration) if (key == 'attack' and c.current_move) else None
+        img = self.assets.frame(c.name.lower(), key, c.anim, progress, c.h * 1.5, c.facing)
+        if img:                                              # real artwork, if this fighter has any
             surf = pygame.Surface((SPR, SPR), pygame.SRCALPHA)
-            img = img if c.facing > 0 else pygame.transform.flip(img, True, False)
             surf.blit(img, (SPR_CX - img.get_width() // 2, SPR_FEET - img.get_height()))
             return surf
         vel = ((c.vx + c.kbx) * c.facing, c.vy + c.kby)
