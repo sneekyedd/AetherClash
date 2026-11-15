@@ -1,0 +1,16 @@
+# Aether Clash lobby server.
+# Start it from the repository root with:   docker compose -f server/docker-compose.yml up -d --build
+services:
+  aether-lobby:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    container_name: aether-lobby
+    restart: unless-stopped
+    ports:
+      - "7777:7777"          # the one port to forward on your router (TCP)
+    environment:
+      UPDATE_MINUTES: "15"   # how often it looks for a newer server on GitHub
+      # GITHUB_TOKEN: ""     # only needed while the GitHub repository is private (read-only token)
+    mem_limit: 128m
+    cpus: 0.5

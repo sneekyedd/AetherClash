@@ -21,8 +21,13 @@ and every move can be described in "frame data" like a real fighting game.
 import json
 import math
 import os
+import queue
 import random
+import socket
+import subprocess
 import sys
+import threading
+import urllib.request
 
 import pygame
 
@@ -3235,18 +3240,33 @@ class ProfileStore:
 
 
 # =====================================================================
-# ONLINE PLAY SCAFFOLDING (not switched on yet)
-# The game is already built for it: every controller produces one small InputState per frame and the
-# simulation runs in fixed 1/60 s steps, so two computers that exchange inputs stay in sync ("lockstep").
-# What exists: the wire format below, NetworkDevice (a remote player's controller), and the relay server
-# in aether_server.py. What is left: OnlineClient's socket code and a lobby screen.
+# ONLINE PLAY
+# Every controller produces one small InputState per frame and the simulation runs in fixed 1/60 s steps,
+# so two computers that exchange inputs stay perfectly in sync ("lockstep"). The lobby server
+# (aether_server.py) only introduces two players and passes their inputs along.
 # =====================================================================
-NET_PROTOCOL_VERSION = 1
-DEFAULT_SERVER = ("127.0.0.1", 7777)
+NET_PROTOCOL_VERSION = 2
+DEFAULT_PORT = 7777
+INPUT_DELAY = 3             # frames between pressing a button and it taking effect online (hides the network trip)
+GITHUB_REPO = "sneekyedd/AetherClash"
+
+
+def game_version():
+    """The release this copy was built from ("dev" when run from source)."""
+    for folder in (getattr(sys, '_MEIPASS', None), os.path.dirname(os.path.abspath(__file__))):
+        try:
+            with open(os.path.join(folder, 'version.txt'), encoding='utf-8') as fh:
+                return fh.read().strip() or "dev"
+        except (OSError, TypeError):
+            pass
+    return "dev"
+
+
+GAME_VERSION = game_version()
 
 
 def encode_input(inp):
-    """Packs one frame of input into a small integer (fits in 2 bytes)."""
+    """Packs one frame of input into a small integer."""
     bits = (inp.x + 1) | ((inp.y + 1) << 2) | (int(inp.down_tap) << 4)
     for i, b in enumerate(BUTTONS):
         bits |= (int(b in inp.held) << (5 + i)) | (int(b in inp.pressed) << (5 + len(BUTTONS) + i))
@@ -3264,25 +3284,138 @@ def decode_input(bits):
     return inp
 
 
-class NetworkDevice:
-    """Input device for a remote player: plays back the inputs received from the network, in order."""
-    def __init__(self):
-        self.queue = []
-
-    def push(self, bits):
-        self.queue.append(bits)
+class QueuedDevice:
+    """Input device used online: plays back the agreed input for the current frame (local or remote)."""
+    def __init__(self, keymap):
+        self.keymap, self.bits = keymap, encode_input(InputState())
 
     def poll(self):
-        return decode_input(self.queue.pop(0)) if self.queue else InputState()
+        return decode_input(self.bits)
+
+
+class NetMatch:
+    """Lockstep bookkeeping. Both computers simulate frame N only once they both hold both players'
+    inputs for frame N, so the two games can never disagree."""
+    def __init__(self, local_slot):
+        neutral = encode_input(InputState())
+        self.local, self.frame, self.sent = local_slot, 0, INPUT_DELAY - 1
+        self.inputs = [{f: neutral for f in range(INPUT_DELAY)} for _ in (0, 1)]
+        self.sums, self.stall, self.desync = {}, 0, False
 
 
 class OnlineClient:
-    """Placeholder for the connection to aether_server.py (see that file for the message format)."""
-    def __init__(self, address=DEFAULT_SERVER):
-        self.address, self.status = address, "offline"
+    """The connection to aether_server.py. Reading happens on a background thread so the game never freezes."""
+    def __init__(self):
+        self.sock, self.inbox, self.status, self.error = None, queue.Queue(), "offline", ""
 
-    def connect(self, player_name):
-        raise NotImplementedError("Online play is not implemented yet.")
+    def connect(self, host, port, name):
+        self.status, self.error = "connecting", ""
+        threading.Thread(target=self._run, args=(host, port, name), daemon=True).start()
+
+    def _run(self, host, port, name):
+        try:
+            sock = socket.create_connection((host, port), timeout=6)
+            sock.settimeout(None)
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            self.sock, self.status = sock, "online"
+            self.send(type="hello", name=name, version=NET_PROTOCOL_VERSION, game=GAME_VERSION)
+            for line in sock.makefile('r', encoding='utf-8'):
+                try:
+                    self.inbox.put(json.loads(line))
+                except ValueError:
+                    pass
+        except OSError as e:
+            self.error = str(e)
+        finally:
+            self.status = "offline"
+            self.inbox.put({"type": "closed"})
+
+    def send(self, **msg):
+        try:
+            if self.sock:
+                self.sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode())
+        except OSError:
+            pass
+
+    def send_input(self, frame, bits):
+        try:
+            if self.sock:
+                self.sock.sendall(b'{"type":"i","f":%d,"b":%d}\n' % (frame, bits))
+        except OSError:
+            pass
+
+    def poll(self):
+        out = []
+        while True:
+            try:
+                out.append(self.inbox.get_nowait())
+            except queue.Empty:
+                return out
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.shutdown(socket.SHUT_RDWR)
+                self.sock.close()
+        except OSError:
+            pass
+        self.sock, self.status = None, "offline"
+
+
+class Updater:
+    """Keeps the packaged game up to date: on start it asks GitHub for the newest release and, if this copy
+    is older, downloads the new AetherClash.exe, swaps it in and restarts. Only runs in the packaged .exe."""
+    def __init__(self):
+        self.status, self.ready, self.exe = "", False, sys.executable
+        if getattr(sys, 'frozen', False) and GAME_VERSION != "dev":
+            try:
+                os.remove(self.exe + ".old")                 # left over from the previous update
+            except OSError:
+                pass
+            self.status = "Checking for updates..."
+            threading.Thread(target=self._run, daemon=True).start()
+
+    @staticmethod
+    def _num(tag):
+        return tuple(int(p) for p in tag.lstrip('v').split('.') if p.isdigit())
+
+    def _run(self):
+        try:
+            req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
+                                         headers={"User-Agent": "AetherClash", "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                rel = json.load(r)
+            tag = rel.get("tag_name", "")
+            if self._num(tag) <= self._num(GAME_VERSION):
+                self.status = f"Up to date ({GAME_VERSION})"
+                return
+            url = next(a["browser_download_url"] for a in rel.get("assets", []) if a["name"].lower().endswith(".exe"))
+            self.status = f"Downloading update {tag}..."
+            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "AetherClash"}), timeout=30) as r, \
+                    open(self.exe + ".new", "wb") as out:
+                total, done = int(r.headers.get("Content-Length", 0)), 0
+                while True:
+                    chunk = r.read(1 << 16)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    done += len(chunk)
+                    if total:
+                        self.status = f"Downloading update {tag}...  {done * 100 // total}%"
+            self.status, self.ready = f"Restarting into {tag}...", True
+        except Exception:                                    # offline, private repository, blocked: just carry on
+            self.status = f"{GAME_VERSION}  (update check unavailable)"
+
+    def apply(self):
+        """Swap the downloaded .exe in and relaunch. Windows lets a running .exe be renamed, not overwritten."""
+        try:
+            os.replace(self.exe, self.exe + ".old")
+            os.replace(self.exe + ".new", self.exe)
+            subprocess.Popen([self.exe])
+            return True
+        except OSError:
+            self.status, self.ready = f"{GAME_VERSION}  (could not install the update)", False
+            return False
 
 
 # =====================================================================
@@ -3292,6 +3425,7 @@ class OnlineClient:
 class GameManager:
     P2_MODES = ["CPU - Easy", "CPU - Normal", "CPU - Hard", "Human"]
     TITLE_OPTIONS = ["Local Play", "Online", "Profiles & Controls", "Quit"]
+    ONLINE_FILE = "aether_clash_online.json"
 
     def __init__(self, headless=False, demo=False, profile_path=None):
         if headless:
@@ -3336,6 +3470,11 @@ class GameManager:
         self.frame = self.intro = self.end_timer = 0
         self.winner = None
         self.duel = None
+        self.rng = random.Random()             # gameplay randomness (kept apart from visual effects for online play)
+        self.net, self.netmatch, self.local_device, self.keep_keys = OnlineClient(), None, None, False
+        self.on = dict(state='address', text=self._load_address(), rooms=[], sel=0, code='', slot=0, opp='', seed=0,
+                       chars=[0, 1], stage=0, ready=[False, False], note='')
+        self.updater = Updater()
         self.cam = pygame.Rect(0, 0, WORLD_W, WORLD_W * 9 // 16)
         self.camf = [600.0, 300.0, 1200.0]
 
@@ -3356,7 +3495,7 @@ class GameManager:
         return prof['name'] if prof else ("CPU" if cpu else f"P{slot + 1}")
 
     # ------------------------------------------------------------ setup
-    def setup_game(self, p1=0, p2=1, stage=0, p2_mode=1, p1_cpu=False, names=None):
+    def setup_game(self, p1=0, p2=1, stage=0, p2_mode=1, p1_cpu=False, names=None, online=None):
         self.map_data = self.stages[stage]
         self.map_data.reset()
         self.fx = Effects()
@@ -3374,12 +3513,14 @@ class GameManager:
             ch = CharacterData(spec['name'], spec['faction'], spec['stats'], spec['moves'], spec, slot, colors)
             sx, sy, facing = self.map_data.spawns[slot]
             ch.reset(sx, sy, facing)
-            cpu = p1_cpu if slot == 0 else not human2
+            cpu = False if online else (p1_cpu if slot == 0 else not human2)
             ch.is_cpu = cpu
             ch.player_name = names[slot] if names else self.slot_name(slot, cpu)
             self.characters[slot + 1] = ch
             self.physics_engine.register_character(ch)
-            if cpu:
+            if online:                                  # both fighters are driven by the agreed network inputs
+                ctrl = CharacterController(ch, self.combat_manager, QueuedDevice(self.slot_keymap(0)))
+            elif cpu:
                 level = 3 if (slot == 0) else p2_mode + 1
                 ctrl = AIController(ch, self.combat_manager, self.physics_engine, min(3, level))
             else:
@@ -3388,6 +3529,9 @@ class GameManager:
             self.controllers[slot + 1] = ctrl
         self.scene, self.paused = 'FIGHT', False
         self.intro, self.end_timer, self.winner, self.frame, self.duel = 100, 0, None, 0, None
+        self.netmatch = NetMatch(online['slot']) if online else None
+        self.rng = random.Random(online['seed']) if online else random.Random()
+        self.local_device = KeyboardDevice(self.slot_keymap(0), self, self.joysticks[0] if self.joysticks else None) if online else None
         self.camf = [600.0, 300.0, 1200.0]
 
     # ------------------------------------------------------------ the loop
@@ -3399,13 +3543,17 @@ class GameManager:
             delta_time = min(self.clock.tick(FPS) / 1000.0, 0.1)
             accumulator += delta_time
             self._watch_performance()
+            if self.updater.ready and self.scene == 'TITLE' and self.updater.apply():
+                break
             self._handle_input_events()                               # 1. input
             steps = 0
             while accumulator >= step * 0.99 and steps < 3:
                 self._step()                                          # 2. physics + 3. combat
                 accumulator -= step
                 steps += 1
-                self.keys_pressed = set()
+                if not self.keep_keys:
+                    self.keys_pressed = set()
+                self.keep_keys = False
             self._render_frame()                                      # 4. state translation + 5. render
             pygame.display.flip()
         pygame.quit()
@@ -3444,8 +3592,7 @@ class GameManager:
             elif k == K.K_ESCAPE:
                 self.running = False
         elif self.scene == 'ONLINE':
-            if enter or k in (K.K_ESCAPE, K.K_BACKSPACE):
-                self.scene = 'TITLE'
+            self._online_key(k, text, up, down, enter)
         elif self.scene == 'PROFILES':
             self._profiles_key(k, text, up, down, enter)
         elif self.scene == 'MENU':
@@ -3468,6 +3615,15 @@ class GameManager:
                 self.p1_cpu = not self.p1_cpu
             elif enter:
                 self.setup_game(self.sel[0], self.sel[1], self.stage_sel, self.p2_mode, self.p1_cpu)
+        elif self.scene == 'FIGHT' and self.netmatch:
+            if k == K.K_ESCAPE:                                       # no pausing online: ESC leaves the match
+                self.net.send(type="bye")
+                self._online_back_to_room("You left the match.")
+            elif k == K.K_F1:
+                self.show_boxes = not self.show_boxes
+        elif self.scene == 'RESULT' and self.netmatch:
+            if enter or k in (K.K_SPACE, K.K_ESCAPE):
+                self._online_back_to_room("")
         elif self.scene == 'FIGHT':
             if k in (K.K_ESCAPE, K.K_p):
                 self.paused = not self.paused
@@ -3542,7 +3698,11 @@ class GameManager:
     def _step(self):
         """One 60th of a second of game time."""
         self.frame += 1
+        if self.scene == 'ONLINE' or (self.netmatch and self.scene == 'RESULT'):
+            self._online_update()
         if self.scene != 'FIGHT' or self.paused:
+            return
+        if self.netmatch and not self._net_gate():                    # online: wait until both inputs for this frame exist
             return
         if self.duel:
             self._step_duel()
@@ -3578,7 +3738,7 @@ class GameManager:
 
     # ------------------------------------------------------------ the Death Ray duel (both players "crypticsh")
     def _new_prompt(self, last=None):
-        return random.choice([a for a, _ in ACTIONS if a != last])
+        return self.rng.choice([a for a, _ in ACTIONS if a != last])
 
     def _start_duel(self, initiator):
         self.duel = dict(counts=[0, 0], prompts=[self._new_prompt(), self._new_prompt()], prev=[(0, 0), (0, 0)],
@@ -3783,6 +3943,12 @@ class GameManager:
             self.text(scr, "CLASH!", 150, (255, 220, 90), mid)
         if self.end_timer > 0:
             self.text(scr, "GAME!", 170, (255, 90, 90), mid)
+        if self.netmatch:
+            if self.netmatch.stall > 20:
+                self.text(scr, "Waiting for the other player...", 34, (255, 220, 120), (SCREEN_WIDTH // 2, 150))
+            if self.netmatch.desync:
+                self.text(scr, "The two games have drifted apart - please rematch", 24, (255, 150, 150), (SCREEN_WIDTH // 2, 24))
+            self.text(scr, "ONLINE   -   ESC leaves the match", 16, (170, 170, 220), (SCREEN_WIDTH // 2, SCREEN_HEIGHT - 10), shadow=False)
         if self.duel:
             self._render_duel(heads)
         if self.paused:
@@ -3901,28 +4067,292 @@ class GameManager:
             r.center = (SCREEN_WIDTH // 2, 322 + i * 62)
             pygame.draw.rect(scr, (14, 10, 34) if sel else (70, 74, 96), r, border_radius=12)
             pygame.draw.rect(scr, (255, 220, 120) if sel else (40, 42, 60), r, 3, border_radius=12)
-            self.text(scr, opt + ("   (coming soon)" if opt == "Online" else ""), 36 if sel else 32,
+            self.text(scr, opt, 36 if sel else 32,
                       (255, 226, 130) if sel else (226, 228, 240), r.center)
         self.text(scr, "W / S  or  UP / DOWN to choose      ENTER to select", 20, (190, 190, 230), (SCREEN_WIDTH // 2, 704),
                   shadow=False)
+        self.text(scr, self.updater.status or f"version {GAME_VERSION}", 18, (190, 190, 230), (SCREEN_WIDTH - 12, 12), 'topright',
+                  shadow=False)
+
+    # ------------------------------------------------------------ online play
+    def _settings_paths(self):
+        return [os.path.join(app_dir(), self.ONLINE_FILE), os.path.join(os.path.expanduser("~"), "." + self.ONLINE_FILE)]
+
+    def _load_address(self):
+        for p in self._settings_paths():
+            try:
+                with open(p, encoding='utf-8') as fh:
+                    return str(json.load(fh).get('server', ''))[:60]
+            except (OSError, ValueError, AttributeError):
+                continue
+        return ""
+
+    def _save_address(self, text):
+        for p in self._settings_paths():
+            try:
+                with open(p, 'w', encoding='utf-8') as fh:
+                    json.dump({'server': text}, fh)
+                return
+            except OSError:
+                continue
+
+    def _online_name(self):
+        prof = self.slot_profile(0)
+        return prof['name'] if prof else "Player"
+
+    def _online_connect(self):
+        o = self.on
+        host, _, port = o['text'].strip().rpartition(':')
+        if not host:
+            host, port = o['text'].strip(), str(DEFAULT_PORT)
+        if not host or not port.isdigit():
+            o['note'] = "Type the server address, for example  myserver.example.com:7777"
+            return
+        self._save_address(o['text'].strip())
+        self.net.close()
+        self.net = OnlineClient()
+        self.net.connect(host, int(port), self._online_name())
+        o.update(state='connecting', note='')
+
+    def _online_disconnect(self, note=""):
+        self.net.close()
+        self.netmatch = None
+        self.on.update(state='address', note=note, rooms=[], code='')
+
+    def _online_back_to_room(self, note):
+        """After a match (or if someone leaves it) both players return to the lobby room, still connected."""
+        self.netmatch = None
+        self.scene = 'ONLINE'
+        self.on.update(state='room', ready=[False, False], note=note)
+
+    def _send_pick(self):
+        o = self.on
+        self.net.send(type="pick", char=o['chars'][o['slot']], stage=o['stage'], ready=o['ready'][o['slot']])
+
+    def _online_key(self, k, text, up, down, enter):
+        K, o, st = pygame, self.on, self.on['state']
+        if st == 'address':
+            if k == K.K_ESCAPE:
+                self.scene = 'TITLE'
+            elif enter:
+                self._online_connect()
+            elif k == K.K_BACKSPACE:
+                o['text'] = o['text'][:-1]
+            elif text and text.isprintable() and len(o['text']) < 60:
+                o['text'] += text
+        elif st == 'connecting':
+            if k == K.K_ESCAPE:
+                self._online_disconnect()
+        elif st == 'lobby':
+            if k == K.K_ESCAPE:
+                self._online_disconnect()
+            elif k == K.K_h:
+                self.net.send(type="host")
+            elif k == K.K_r:
+                self.net.send(type="list")
+            elif (up or down) and o['rooms']:
+                o['sel'] = (o['sel'] + (1 if down else -1)) % len(o['rooms'])
+            elif enter and o['rooms']:
+                self.net.send(type="join", code=o['rooms'][o['sel'] % len(o['rooms'])]['code'])
+        elif st == 'hosting':
+            if k == K.K_ESCAPE:
+                self.net.send(type="leave")
+                self.net.send(type="list")
+                o['state'] = 'lobby'
+        elif st == 'room':
+            me = o['slot']
+            if k == K.K_ESCAPE:
+                self.net.send(type="leave")
+                self.net.send(type="list")
+                o.update(state='lobby', note='')
+            elif k in (K.K_a, K.K_d, K.K_LEFT, K.K_RIGHT) and not o['ready'][me]:
+                o['chars'][me] = (o['chars'][me] + (1 if k in (K.K_d, K.K_RIGHT) else -1)) % len(ROSTER)
+                self._send_pick()
+            elif (up or down) and me == 0 and not o['ready'][0]:
+                o['stage'] = (o['stage'] + (1 if down else -1)) % len(self.stages)
+                self._send_pick()
+            elif enter:
+                o['ready'][me] = not o['ready'][me]
+                self._send_pick()
+
+    def _online_update(self):
+        """Runs every frame on the online screens: follows the connection and handles server messages."""
+        o = self.on
+        if o['state'] == 'connecting' and self.net.status == 'online':
+            o['state'] = 'lobby'
+            self.net.send(type="list")
+        if o['state'] == 'lobby' and self.frame % 120 == 0:
+            self.net.send(type="list")
+        msgs = self.net.poll()
+        for idx, m in enumerate(msgs):
+            kind = m.get('type')
+            if kind == 'closed':
+                if o['state'] != 'address':
+                    self.scene = 'ONLINE'
+                    self._online_disconnect("Could not reach the server." if o['state'] == 'connecting'
+                                            else "The connection to the server was lost.")
+            elif kind == 'error':
+                o['note'] = str(m.get('reason', ''))[:90]
+                if o['state'] == 'connecting':
+                    self._online_disconnect(o['note'])
+            elif kind == 'rooms':
+                o['rooms'] = [r for r in m.get('rooms', []) if isinstance(r, dict)][:10]
+            elif kind == 'hosted':
+                o.update(state='hosting', code=str(m.get('code', '')), note='')
+            elif kind == 'paired':
+                o.update(state='room', slot=int(m.get('slot', 0)), opp=str(m.get('opponent', 'Player'))[:12],
+                         seed=int(m.get('seed', 0)), ready=[False, False], note='')
+                self.net.send(type="ver", game=GAME_VERSION)
+                self._send_pick()
+            elif kind == 'ver' and m.get('game') != GAME_VERSION:
+                o['note'] = f"Different game versions (you {GAME_VERSION}, them {m.get('game')}). Both should update."
+            elif kind == 'pick' and o['state'] == 'room':
+                other = 1 - o['slot']
+                o['chars'][other] = int(m.get('char', 0)) % len(ROSTER)
+                o['ready'][other] = bool(m.get('ready'))
+                if other == 0:
+                    o['stage'] = int(m.get('stage', 0)) % len(self.stages)
+            elif kind == 'opponent_left':
+                self.netmatch = None
+                self.scene = 'ONLINE'
+                if o['slot'] == 0 and o['state'] in ('room',):       # the host keeps the lobby open
+                    o.update(state='hosting', note=f"{o['opp']} left.")
+                else:
+                    o.update(state='lobby', note="The host closed the lobby.")
+                    self.net.send(type="list")
+            elif kind == 'start' and o['state'] == 'room':
+                self._online_start(int(m['c0']), int(m['c1']), int(m['stage']))
+                for rest in msgs[idx + 1:]:                           # the host's first inputs may already be here:
+                    self.net.inbox.put(rest)                          # hand them on to the match
+                return
+        if o['state'] == 'room' and o['slot'] == 0 and all(o['ready']):   # the host starts the match for both
+            self.net.send(type="start", c0=o['chars'][0], c1=o['chars'][1], stage=o['stage'])
+            self._online_start(o['chars'][0], o['chars'][1], o['stage'])
+
+    def _online_start(self, c0, c1, stage):
+        o = self.on
+        o['ready'] = [False, False]
+        names = [self._online_name(), o['opp']] if o['slot'] == 0 else [o['opp'], self._online_name()]
+        self.setup_game(c0 % len(ROSTER), c1 % len(ROSTER), stage % len(self.stages), names=names,
+                        online=dict(slot=o['slot'], seed=o['seed']))
+
+    def _net_gate(self):
+        """Lockstep: sample and send our input a few frames ahead, and only let the simulation advance
+        when both players' inputs for the current frame have arrived. Returns True if the frame may run."""
+        nm = self.netmatch
+        msgs = self.net.poll()
+        for idx, m in enumerate(msgs):
+            kind = m.get('type')
+            if kind == 'i':
+                nm.inputs[1 - nm.local][int(m['f'])] = int(m['b'])
+            elif kind == 'c':                                         # compare game-state fingerprints
+                mine = nm.sums.get(m.get('f'))
+                if mine is not None and mine != m.get('h'):
+                    nm.desync = True
+            elif kind == 'bye':
+                for rest in msgs[idx + 1:]:
+                    self.net.inbox.put(rest)
+                self._online_back_to_room(f"{self.on['opp']} left the match.")
+                return False
+            elif kind in ('opponent_left', 'closed'):
+                for rest in msgs[idx:]:                               # let the lobby logic deal with it
+                    self.net.inbox.put(rest)
+                self.netmatch = None
+                self.scene = 'ONLINE'
+                return False
+        if nm.sent < nm.frame + INPUT_DELAY:
+            nm.sent += 1
+            bits = encode_input(self.local_device.poll())
+            nm.inputs[nm.local][nm.sent] = bits
+            self.net.send_input(nm.sent, bits)
+        else:
+            self.keep_keys = True                                     # nothing sampled: keep the key presses for next time
+        a, b = nm.inputs[0].get(nm.frame), nm.inputs[1].get(nm.frame)
+        if a is None or b is None:
+            nm.stall += 1
+            return False
+        nm.stall = 0
+        self.controllers[1].device.bits, self.controllers[2].device.bits = a, b
+        nm.inputs[0].pop(nm.frame - 1, None)
+        nm.inputs[1].pop(nm.frame - 1, None)
+        if nm.frame % 120 == 0:
+            h = sum(int(c.x * 8) + int(c.y * 8) * 3 + int(c.cumulative_damage_taken * 10) * 7 + c.current_lives * 1009
+                    for c in self.characters.values()) & 0xFFFFFF
+            nm.sums[nm.frame] = h
+            nm.sums.pop(nm.frame - 1200, None)
+            self.net.send(type="c", f=nm.frame, h=h)
+        nm.frame += 1
+        return True
 
     def _render_online(self):
-        scr = self.screen
-        self.text(scr, "ONLINE PLAY", 96, (255, 220, 120), (SCREEN_WIDTH // 2, 90))
-        self.text(scr, "Coming soon", 44, WHITE, (SCREEN_WIDTH // 2, 160))
-        box = pygame.Rect(190, 220, 900, 330)
-        self.panel(box, (96, 170, 255))
-        lines = ["Online matches are not playable yet, but the groundwork is in place:",
-                 "",
-                 "   -  Every player's controls are already reduced to one tiny message per frame.",
-                 "   -  The game runs in exact 1/60 second steps, so two computers stay in sync.",
-                 "   -  A match relay server is included (aether_server.py) to pair two players.",
-                 "",
-                 f"Planned server address:  {DEFAULT_SERVER[0]} : {DEFAULT_SERVER[1]}        Status:  offline",
-                 f"Network protocol version:  {NET_PROTOCOL_VERSION}"]
-        for i, ln in enumerate(lines):
-            self.text(scr, ln, 26, (225, 225, 245), (box.x + 30, box.y + 28 + i * 35), 'topleft', False)
-        self.text(scr, "ESC  back", 28, (255, 220, 120), (SCREEN_WIDTH // 2, 620))
+        scr, o, st = self.screen, self.on, self.on['state']
+        mid = SCREEN_WIDTH // 2
+        self.text(scr, "ONLINE PLAY", 90, (255, 220, 120), (mid, 70))
+        gold, soft = (255, 220, 120), (215, 215, 240)
+        if st in ('address', 'connecting'):
+            box = pygame.Rect(240, 200, 800, 250)
+            self.panel(box, (96, 170, 255))
+            self.text(scr, "Server address", 34, WHITE, (mid, box.y + 44))
+            field = pygame.Rect(box.x + 60, box.y + 84, box.w - 120, 56)
+            pygame.draw.rect(scr, (8, 6, 24), field, border_radius=10)
+            pygame.draw.rect(scr, gold, field, 3, border_radius=10)
+            cursor = "_" if (self.frame // 20) % 2 and st == 'address' else ""
+            self.text(scr, (o['text'] + cursor) or " ", 38, WHITE, field.center)
+            self.text(scr, "Connecting..." if st == 'connecting' else "for example   myserver.example.com:7777   or   203.0.113.5:7777",
+                      24, gold if st == 'connecting' else soft, (mid, box.y + 176), shadow=False)
+            self.text(scr, f"You will appear as:  {self._online_name()}    (choose a profile as Player 1 to change it)", 22, soft,
+                      (mid, box.y + 214), shadow=False)
+            foot = "ESC cancel" if st == 'connecting' else "ENTER connect        ESC back"
+        elif st == 'lobby':
+            box = pygame.Rect(290, 150, 700, 400)
+            self.panel(box, (96, 170, 255))
+            self.text(scr, "Open lobbies", 36, WHITE, (mid, box.y + 34))
+            if not o['rooms']:
+                self.text(scr, "Nobody is hosting right now.", 28, soft, (mid, box.y + 130), shadow=False)
+                self.text(scr, "Press H to host a lobby and wait for a friend.", 26, gold, (mid, box.y + 170), shadow=False)
+            for i, r in enumerate(o['rooms']):
+                sel = i == o['sel'] % len(o['rooms'])
+                row = pygame.Rect(box.x + 30, box.y + 70 + i * 32, box.w - 60, 30)
+                if sel:
+                    pygame.draw.rect(scr, (70, 50, 110), row, border_radius=8)
+                self.text(scr, f"{r.get('host', '?')}'s lobby", 28, gold if sel else WHITE, (row.x + 14, row.centery), 'midleft')
+                self.text(scr, str(r.get('code', '')), 24, soft, (row.right - 14, row.centery), 'midright', False)
+            foot = "H host a lobby      UP / DOWN choose      ENTER join      R refresh      ESC disconnect"
+        elif st == 'hosting':
+            box = pygame.Rect(340, 200, 600, 250)
+            self.panel(box, gold)
+            self.text(scr, "Your lobby is open", 40, WHITE, (mid, box.y + 50))
+            self.text(scr, f"Lobby code:  {o['code']}", 54, gold, (mid, box.y + 122))
+            self.text(scr, "Waiting for another player to join" + "." * (1 + (self.frame // 30) % 3), 28, soft,
+                      (mid, box.y + 194), shadow=False)
+            foot = "ESC close the lobby"
+        else:                                                         # the room: both players pick and ready up
+            names = [self._online_name(), o['opp']] if o['slot'] == 0 else [o['opp'], self._online_name()]
+            for slot in (0, 1):
+                spec = ROSTER[o['chars'][slot] % len(ROSTER)]
+                card = pygame.Rect(90 if slot == 0 else SCREEN_WIDTH - 470, 130, 380, 400)
+                self.panel(card, PLAYER_TAGS[slot])
+                mine = slot == o['slot']
+                self.text(scr, names[slot] + ("  (you)" if mine else ""), 30, PLAYER_TAGS[slot], (card.centerx, card.y + 28))
+                spr = quick_sprite(spec, spec['colors'], 'idle', 1 if slot == 0 else -1, self.frame, 1.7, assets=self.assets)
+                scr.blit(spr, (card.centerx - SPR_CX * 1.7, card.y + 290 - SPR_FEET * 1.7))
+                self.text(scr, (f"<  {spec['name'].upper()}  >" if mine and not o['ready'][slot] else spec['name'].upper()),
+                          40, WHITE, (card.centerx, card.y + 320))
+                self.text(scr, "READY!" if o['ready'][slot] else "choosing...", 30,
+                          (120, 255, 150) if o['ready'][slot] else soft, (card.centerx, card.y + 364))
+            stg = self.stages[o['stage'] % len(self.stages)]
+            self.text(scr, "VS", 70, WHITE, (mid, 190))
+            thumb = self.thumbs[o['stage'] % len(self.stages)]
+            tr = thumb.get_rect(center=(mid, 340))
+            scr.blit(thumb, tr)
+            pygame.draw.rect(scr, gold, tr, 3, border_radius=4)
+            self.text(scr, f"<  {stg.name}  >" if o['slot'] == 0 else stg.name, 28, gold, (mid, 244))
+            self.text(scr, "the host picks the stage", 20, soft, (mid, 440), shadow=False)
+            foot = ("A / D fighter      " + ("W / S stage      " if o['slot'] == 0 else "") +
+                    "ENTER ready / not ready      ESC leave")
+        if o['note']:
+            self.text(scr, o['note'], 26, (255, 150, 150), (mid, 590))
+        self.text(scr, foot, 24, gold, (mid, 650))
 
     def _render_profiles(self):
         scr, profs = self.screen, self.profiles.profiles
@@ -4054,7 +4484,8 @@ class GameManager:
             self.text(scr, f"{w.name}, {w.spec['title']}  -  {w.current_lives} lives left", 30, WHITE, (SCREEN_WIDTH // 2, 170))
         else:
             self.text(scr, "DRAW!", 110, WHITE, (SCREEN_WIDTH // 2, 100))
-        self.text(scr, "ENTER: rematch        ESC: character select", 32, (255, 220, 120), (SCREEN_WIDTH // 2, 680))
+        self.text(scr, "ENTER: back to the lobby" if self.netmatch else "ENTER: rematch        ESC: character select", 32,
+                  (255, 220, 120), (SCREEN_WIDTH // 2, 680))
 
     def stop_game(self):
         self.running = False

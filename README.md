@@ -41,11 +41,48 @@ python aether_clash.py
 bindings. Pick a profile on the character screen (Q / E for Player 1, [ / ] for Player 2). Profiles are saved in
 `aether_clash_profiles.json` next to the game.
 
-## Online
+## Online play
 
-The start menu has an **Online** entry, but online play is not implemented yet. The groundwork is there: a
-compact per-frame input format, a `NetworkDevice` controller, and `aether_server.py`, a small relay server that
-pairs two players (`python aether_server.py`).
+Choose **Online** on the start menu, type the lobby server's address (for example `myserver.example.com:7777`) and
+press Enter. Then either press **H** to host a lobby, or pick a friend's lobby from the list and press Enter.
+Both players choose a fighter, the host chooses the stage, and the match starts when both press Enter.
+
+- Your name online is the profile selected for Player 1 (make one under Profiles & Controls).
+- You always use Player 1's keys online, whichever side you are on.
+- Both players must be on the same game version.
+- There is no pausing online; Esc leaves the match and returns both players to the lobby.
+
+How it works: the two games run the same simulation and only exchange button presses through the server, a few
+frames ahead ("lockstep"). The server does no game logic, so it needs almost no CPU, memory or bandwidth.
+
+## Hosting the lobby server
+
+The server is one small Python file, `aether_server.py`. It needs **one TCP port (7777)** open to the internet.
+
+**With Docker** (from a copy of this repository on the server):
+
+```bash
+docker compose -f server/docker-compose.yml up -d --build
+```
+
+**Without Docker** (Python 3.9 or newer):
+
+```bash
+python server/run_server.py
+```
+
+Then on your router, forward **TCP port 7777** to the server's local IP address. Players connect to your public IP
+address or domain name followed by `:7777`.
+
+`server/run_server.py` keeps the server up to date: every 15 minutes it checks GitHub for a newer
+`aether_server.py` and restarts onto it once nobody is connected. While the repository is private it needs a
+read-only GitHub token in the `GITHUB_TOKEN` setting.
+
+## Automatic updates
+
+The packaged game checks GitHub for a newer release each time it starts. If there is one it downloads the new
+`AetherClash.exe`, swaps it in and restarts. This only works while the repository's releases are publicly
+downloadable.
 
 ## Fighters
 

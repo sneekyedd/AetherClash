@@ -6,6 +6,8 @@ on:
   push:
     paths-ignore:
       - '**.md'
+      - 'server/**'
+      - 'aether_server.py'
   workflow_dispatch:
 
 permissions:
@@ -35,6 +37,10 @@ jobs:
           SDL_VIDEODRIVER: dummy
           SDL_AUDIODRIVER: dummy
 
+      - name: Stamp the version
+        shell: bash
+        run: echo "v0.1.${{ github.run_number }}" > version.txt
+
       - name: Draw the game icon
         run: python aether_clash.py --make-icon icon.png
         env:
@@ -42,7 +48,7 @@ jobs:
           SDL_AUDIODRIVER: dummy
 
       - name: Build AetherClash.exe
-        run: pyinstaller --onefile --windowed --name AetherClash --icon icon.png --add-data "assets;assets" aether_clash.py
+        run: pyinstaller --onefile --windowed --name AetherClash --icon icon.png --add-data "assets;assets" --add-data "version.txt;." aether_clash.py
 
       - name: Publish release
         shell: bash
