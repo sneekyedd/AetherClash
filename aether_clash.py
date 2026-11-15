@@ -2858,7 +2858,8 @@ class AssetLibrary:
                uspecial dspecial grab). Draw the fighter facing right on a transparent background.
                assets/<fighter>/sprite.json           optional {"scale": 0.8, "fps": 9,
                                                        "anchors": {"jab": [body_centre_x, feet_y], ...},
-                                                       "zoom": {"idle": 0.85, ...}}  (per-image size tweak)
+                                                       "zoom": {"idle": 0.85, ...},  (per-image size tweak)
+                                                       "pose_fps": {"idle": 2.5}}
     Stages:    assets/bg_<stage>.png                  2400x1400 background (atoll, loom, crucible)
 
     Folders are searched in this order: the AETHER_CLASH_ASSETS environment variable, an "assets" folder next
@@ -2914,14 +2915,18 @@ class AssetLibrary:
                 a = anchors.get(stem) or [img.get_width() / 2, img.get_height()]
                 frames.setdefault(pose, []).append((img, a[0], a[1], cfg.get('zoom', {}).get(stem, 1.0)))
             self.sets[name] = dict(frames=frames, scale=cfg.get('scale'), height=cfg.get('height'),
-                                   fps=cfg.get('fps', 10)) if frames else None
+                                   fps=cfg.get('fps', 10), pose_fps=cfg.get('pose_fps', {})) if frames else None
         return self.sets[name]
 
     def has(self, name, pose):
         art = self.fighter(name)
         return bool(art and pose in art['frames'])
 
-    def frame(self, name, pose, tick, progress, target_height, facing, zoom=1.0):
+    def count(self, name, pose):
+        art = self.fighter(name)
+        return len(art['frames'].get(pose, ())) if art else 0
+
+    def frame(self, name, pose, tick, progress, target_height, facing, zoom=1.0, index=None):
         """The image to show right now, scaled and flipped, with where the body centre and feet are in it.
         Returns (image, anchor_x, anchor_y) or None."""
         art = self.fighter(name)
@@ -2932,10 +2937,12 @@ class AssetLibrary:
             seen.add(pose)
             pose = SPRITE_FALLBACK.get(pose, 'idle')
         seq = frames.get(pose) or frames.get('idle') or next(iter(frames.values()))
-        if progress is not None:                              # plays once, in step with the move
-            i = min(len(seq) - 1, int(progress * len(seq)))
+        if index is not None:                                 # the caller picked an exact frame
+            i = clamp(index, 0, len(seq) - 1)
+        elif progress is not None:                            # plays once, in step with the action
+            i = min(len(seq) - 1, int(clamp(progress, 0.0, 0.999) * len(seq)))
         else:
-            i = int(tick * art['fps'] / FPS) % len(seq)
+            i = int(tick * art['pose_fps'].get(pose, art['fps']) / FPS) % len(seq)
         img, ax, ay, own_zoom = seq[i]
         ref = (frames.get('idle') or seq)[0][0]
         k = (art['scale'] or (art['height'] or target_height) / ref.get_height()) * zoom * own_zoom
@@ -3024,6 +3031,15 @@ class StateTranslator:
             v['alpha'] = 120
         if c.current_move and c.current_move.aim and c.current_move.aim[1] <= c.move_frame <= c.current_move.aim[2]:
             v['alpha'] = 0
+        if self.assets.fighter(c.name.lower()):              # real artwork carries its own effects: keep overlays light
+            if state in ("HIT", "STUN", "GRABBED", "GRABBING", "RESPAWN"):
+                v['outline'] = None
+            if state == "PARRY_SUCCESS" and self.assets.has(c.name.lower(), 'parry'):
+                v['tint'] = v['outline'] = None
+            if state == "STUN":
+                v['tint'] = None
+            if state == "DODGE":
+                v['alpha'] = 200
         return v
 
     def sprite_for(self, c, v):
@@ -3042,6 +3058,8 @@ class StateTranslator:
     def art_window(self, c):
         """True while a move's own artwork (which has its effect painted in) should be on screen."""
         m, f = c.current_move, c.move_frame
+        if self.assets.count(c.name.lower(), m.slot) == 3:
+            return True
         boxes = [b for b in m.hitbox_data if not b['spike']] or m.hitbox_data
         if m is DEATH_RAY:
             return False
@@ -3054,17 +3072,30 @@ class StateTranslator:
     def _art_sprite(self, c, name, key):
         """Builds this frame's sprite from the fighter's artwork. Poses with no art of their own are
         brought to life by tilting, bobbing and stretching the nearest pose."""
-        pose, tilt, bob = key, 0.0, 0.0
+        pose, tilt, bob, index, progress = key, 0.0, 0.0, None, None
         if key == 'attack' and c.current_move:
-            m = c.current_move
-            if self.art_window(c) and self.assets.has(name, m.slot):
+            m, f = c.current_move, c.move_frame
+            boxes = [b for b in m.hitbox_data if not b['spike']] or m.hitbox_data
+            if self.assets.count(name, m.slot) == 3 and boxes:            # startup / active / recovery art
+                pose = m.slot
+                index = 0 if f < min(b['start'] for b in boxes) - 1 else 1 if f <= max(b['end'] for b in boxes) + 5 else 2
+            elif self.art_window(c) and self.assets.has(name, m.slot):
                 pose = m.slot
             else:
                 pose = 'idle' if c.ground else 'fall'
-                early = m.hitbox_data and c.move_frame < min(b['start'] for b in m.hitbox_data)
+                early = m.hitbox_data and f < min(b['start'] for b in m.hitbox_data)
                 tilt = 8.0 if early else -3.0                 # lean back to wind up, settle afterwards
         elif key == 'gun':
             pose = 'idle'
+        elif key == 'shield':                                 # the bubble shrinks and cracks as the shield weakens
+            n = self.assets.count(name, 'shield')
+            index = int((1 - c.shield_hp / SHIELD_MAX) * n) if n > 1 else None
+        elif key == 'parry':
+            progress = 1 - c.state_timer / 24
+        elif key == 'dodge':
+            progress = 1 - c.dodge_timer / 24
+        elif key == 'hurt':
+            index = 1 if c.is_knocked_down else 0
         if not self.assets.has(name, pose) and pose in ('run', 'jump', 'fall', 'dodge', 'helpless', 'stun', 'grabbed'):
             if pose == 'run':
                 tilt, bob = -7.0, abs(math.sin(c.anim * 0.36)) * 5
@@ -3078,7 +3109,7 @@ class StateTranslator:
                 tilt = 10.0
         if pose in ('idle', 'shield') or (pose == 'run' and bob):
             bob += math.sin(c.anim * 0.07) * 1.2               # breathing
-        img, ax, ay = self.assets.frame(name, pose, c.anim, None, c.h * 1.5, c.facing)
+        img, ax, ay = self.assets.frame(name, pose, c.anim, progress, c.h * 1.5, c.facing, index=index)
         if c.slot == 1 and len({o.name for o in self.roster}) == 1:      # mirror match: player 2 gets a cool tint
             img = img.copy()
             img.fill((170, 190, 255, 255), special_flags=pygame.BLEND_RGBA_MULT)
@@ -3145,7 +3176,7 @@ class StateTranslator:
                     elif not (self.assets.has(c.name.lower(), c.current_move.slot) and self.art_window(c)):
                         draw_attack_fx(surface, c, box, r, physics.frame)
             cx, cy = c.center
-            if c.current_state == "SHIELD":
+            if c.current_state == "SHIELD" and not self.assets.has(c.name.lower(), 'shield'):
                 rad = int((c.h * 0.42 + 14) * (0.55 + 0.45 * c.shield_hp / SHIELD_MAX))
                 bubble = pygame.Surface((rad * 2, rad * 2), pygame.SRCALPHA)
                 col = (120, 255, 150) if c.shield_frame <= PARRY_WINDOW else PLAYER_TAGS[c.slot % 2]
@@ -3678,7 +3709,10 @@ class GameManager:
         scene = self.scene
         if scene in ('TITLE', 'ONLINE', 'PROFILES', 'MENU'):
             self._menu_backdrop()
-            {'TITLE': self._render_title, 'ONLINE': self._render_online,
+            if scene == 'TITLE':
+                self._render_title()
+                return
+            {'ONLINE': self._render_online,
              'PROFILES': self._render_profiles, 'MENU': self._render_menu}[scene]()
             return
         view = self.cam.copy()
@@ -3812,23 +3846,64 @@ class GameManager:
             self.text(scr, tip, 21, (220, 220, 240), (SCREEN_WIDTH // 2, y + 338 + i * 24), shadow=False)
 
     # ------------------------------------------------------------ menu screens
+    def _title_backdrop(self):
+        """Starry purple night over mossy stone ground (built once)."""
+        if not hasattr(self, 'title_bg'):
+            bg = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT))
+            for y in range(SCREEN_HEIGHT):
+                pygame.draw.line(bg, lerp_color((16, 10, 40), (64, 30, 96), (y / SCREEN_HEIGHT) ** 1.4), (0, y), (SCREEN_WIDTH, y))
+            rng = random.Random(11)
+            for _ in range(7):                                # soft nebula clouds
+                glow(bg, rng.choice([(120, 60, 170), (70, 50, 150), (150, 70, 150)]),
+                     (rng.randint(0, SCREEN_WIDTH), rng.randint(60, 520)), rng.randint(160, 320), 34)
+            self.title_stars = [(rng.randint(0, SCREEN_WIDTH), rng.randint(0, 560), rng.choice([1, 1, 1, 2, 2, 3]),
+                                 rng.choice([WHITE, (255, 200, 255), (160, 200, 255), (255, 230, 170)]), rng.uniform(0, 6))
+                                for _ in range(150)]
+            ground = self.assets.get('ui_ground')
+            self.title_ground_y = SCREEN_HEIGHT - 110
+            if ground:
+                g = pygame.transform.scale(ground, (ground.get_width() * 2, ground.get_height() * 2))
+                for x in range(0, SCREEN_WIDTH, g.get_width()):
+                    bg.blit(g, (x, self.title_ground_y - 8))
+            else:
+                pygame.draw.rect(bg, (44, 40, 60), (0, self.title_ground_y, SCREEN_WIDTH, 120))
+                pygame.draw.rect(bg, (70, 110, 70), (0, self.title_ground_y, SCREEN_WIDTH, 10))
+            small = pygame.transform.smoothscale(bg, (SCREEN_WIDTH // PIXEL, SCREEN_HEIGHT // PIXEL))
+            self.title_bg = pygame.transform.scale(small, (SCREEN_WIDTH, SCREEN_HEIGHT))
+        scr = self.screen
+        scr.blit(self.title_bg, (0, 0))
+        for x, y, r, col, ph in self.title_stars:             # twinkling stars
+            k = 0.5 + 0.5 * math.sin(self.frame * 0.05 + ph)
+            if r >= 3:
+                pygame.draw.polygon(scr, lerp_color((60, 40, 100), col, k), star_points(x, y, 4 + 3 * k))
+            else:
+                pygame.draw.rect(scr, lerp_color((60, 40, 100), col, k), (x, y, r * 2, r * 2))
+
     def _render_title(self):
         scr, t = self.screen, self.frame
-        for i, spec in enumerate(ROSTER):                            # the cast idles along the bottom
-            x = (110, 310, 970, 1170)[i]
-            spr = quick_sprite(spec, spec['colors'], 'idle', 1 if i < 2 else -1, t + i * 37, assets=self.assets)
-            scr.blit(spr, (x - SPR_CX * 3 // 2, 620 - SPR_FEET * 3 // 2))
-            self.text(scr, spec['name'].upper(), 26, spec['colors']['accent'], (x, 644))
-        scr.blit(self.logo, self.logo.get_rect(center=(SCREEN_WIDTH // 2, 110)))
-        self.text(scr, "AETHER CLASH", 110, (255, 220, 120), (SCREEN_WIDTH // 2, 240))
+        self._title_backdrop()
+        gy = self.title_ground_y
+        for i, spec in enumerate(ROSTER):                            # the cast stands on the ground
+            x = (120, 320, 960, 1160)[i]
+            spr = quick_sprite(spec, spec['colors'], 'idle', 1 if i < 2 else -1, t + i * 37, 1.9, assets=self.assets)
+            scr.blit(spr, (x - SPR_CX * 1.9, gy + 6 - SPR_FEET * 1.9))
+            self.text(scr, spec['name'].upper(), 24, spec['colors']['accent'], (x, gy + 34))
+        scr.blit(self.logo, self.logo.get_rect(center=(SCREEN_WIDTH // 2, 96)))
+        for dx, dy, col in ((0, 6, (90, 50, 10)), (0, 3, (170, 100, 20)), (0, 0, (255, 214, 110))):   # chunky gold lettering
+            self.text(scr, "AETHER CLASH", 118, col, (SCREEN_WIDTH // 2 + dx, 226 + dy), shadow=False)
+        self.text(scr, "AETHER CLASH", 118, (255, 244, 190), (SCREEN_WIDTH // 2, 223), shadow=False).inflate(0, 0)
+        self.text(scr, "AETHER CLASH", 118, (255, 214, 110), (SCREEN_WIDTH // 2, 226), shadow=False)
+        for sx in (-330, 330):
+            pygame.draw.polygon(scr, (255, 240, 180), star_points(SCREEN_WIDTH // 2 + sx, 196, 12 + 3 * math.sin(t * 0.08)))
         for i, opt in enumerate(self.TITLE_OPTIONS):
             sel = i == self.title_sel
-            r = pygame.Rect(0, 0, 400, 54)
-            r.center = (SCREEN_WIDTH // 2, 340 + i * 66)
-            self.panel(r, (255, 220, 120) if sel else None, 220 if sel else 120)
-            self.text(scr, opt + ("   (coming soon)" if opt == "Online" else ""), 40 if sel else 34,
-                      (255, 220, 120) if sel else (200, 200, 230), r.center)
-        self.text(scr, "W / S  or  UP / DOWN to choose      ENTER to select", 22, (170, 170, 220), (SCREEN_WIDTH // 2, 700),
+            r = pygame.Rect(0, 0, 400, 50)
+            r.center = (SCREEN_WIDTH // 2, 322 + i * 62)
+            pygame.draw.rect(scr, (14, 10, 34) if sel else (70, 74, 96), r, border_radius=12)
+            pygame.draw.rect(scr, (255, 220, 120) if sel else (40, 42, 60), r, 3, border_radius=12)
+            self.text(scr, opt + ("   (coming soon)" if opt == "Online" else ""), 36 if sel else 32,
+                      (255, 226, 130) if sel else (226, 228, 240), r.center)
+        self.text(scr, "W / S  or  UP / DOWN to choose      ENTER to select", 20, (190, 190, 230), (SCREEN_WIDTH // 2, 704),
                   shadow=False)
 
     def _render_online(self):
