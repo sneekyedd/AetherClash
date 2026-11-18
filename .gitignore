@@ -5,3 +5,6 @@ icon.png
 build/
 dist/
 *.spec
+server.txt
+server/updates/
+server/players.txt

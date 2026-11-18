@@ -18,6 +18,7 @@ Architecture (one class per module of the blueprint):
 Everything is simulated in whole frames at 60 FPS, so the game is deterministic
 and every move can be described in "frame data" like a real fighting game.
 """
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,7 @@ import socket
 import subprocess
 import sys
 import threading
+import urllib.parse
 import urllib.request
 
 import pygame
@@ -94,13 +96,25 @@ def lerp_color(a, b, t):
 # 1. DATA STRUCTURES (Module 1)
 # =====================================================================
 
+def rect_to_circles(w, h):
+    """Hitboxes are circles (like the spheres in a Smash-style fighter). A box is turned into one circle of
+    the same area, or for a long thin box a chain of overlapping circles along its length.
+    Returns (dx, dy, radius) offsets from the box centre."""
+    long_, short = max(w, h), max(1, min(w, h))
+    n = max(1, round(long_ / short)) if long_ > short * 1.6 else 1
+    seg = long_ / n
+    r = math.sqrt(seg * short / math.pi)
+    offs = [-long_ / 2 + (i + 0.5) * seg for i in range(n)]
+    return [(o, 0.0, r) if w >= h else (0.0, o, r) for o in offs]
+
+
 def hb(start, end, x, y, w, h, damage, force, angle, gid=0, **flags):
     """One hitbox. Active on move frames start..end. (x, y) is its centre relative to the
     fighter's centre (x is 'forward'). angle: 0 = forward, 90 = straight up, 270 = spike.
     Hitboxes sharing a gid can only hit a target once between them (multi-hit moves use several gids).
     spike=True marks a "spike spot": if it connects with an AIRBORNE target they are launched straight down.
     Spike spots are listed before the move's ordinary hitboxes so they take priority when both overlap."""
-    d = dict(start=start, end=end, rect=(x, y, w, h), damage=damage, force=force,
+    d = dict(start=start, end=end, rect=(x, y, w, h), circles=rect_to_circles(w, h), damage=damage, force=force,
              angle=angle, gid=gid, grab=False, radial=False, pull=False, spike=False, unblockable=False)
     d.update(flags)
     return d
@@ -184,6 +198,7 @@ class CharacterData:
         self.grab_timer = self.grab_frames = self.pommel_cd = self.pommel_anim = 0
         self.pose = None                  # smoothed skeleton pose (owned by the StateTranslator)
         self.cloth = None                 # rope physics for scarves, hair and flames
+        self.vis = None                   # visual-only animation tracker (stride, flips, landings)
         self.squash = 0.0                 # >0 stretched tall (jumping), <0 squashed flat (landing)
 
     @property
@@ -807,9 +822,23 @@ class PhysicsEngine:
         self.projectiles = [p for p in self.projectiles if not p.dead]
 
     # ------------------------------------------------------------ hitboxes
+    @staticmethod
+    def hitbox_circles(c, box):
+        """The box's circles in world space: [(x, y, radius), ...]."""
+        x, y = box['rect'][0], box['rect'][1]
+        return [(c.x + (x + dx) * c.facing, c.y - c.h / 2 + y + dy, r) for dx, dy, r in box['circles']]
+
     def hitbox_rect(self, c, box):
-        x, y, w, h = box['rect']
-        return pygame.Rect(int(c.x + x * c.facing - w / 2), int(c.y - c.h / 2 + y - h / 2), w, h)
+        """Bounding rectangle of the box's circles (for effects that only need a rough area)."""
+        cs = self.hitbox_circles(c, box)
+        x0, x1 = min(x - r for x, _, r in cs), max(x + r for x, _, r in cs)
+        y0, y1 = min(y - r for _, y, r in cs), max(y + r for _, y, r in cs)
+        return pygame.Rect(int(x0), int(y0), max(1, int(x1 - x0)), max(1, int(y1 - y0)))
+
+    @staticmethod
+    def circle_hits_rect(cx, cy, r, rect):
+        nx, ny = clamp(cx, rect.left, rect.right), clamp(cy, rect.top, rect.bottom)
+        return (cx - nx) ** 2 + (cy - ny) ** 2 <= r * r
 
     def active_hitboxes(self, c):
         m = c.current_move
@@ -818,7 +847,7 @@ class PhysicsEngine:
         return [b for b in m.hitbox_data if b['start'] <= c.move_frame <= b['end']]
 
     def _update_active_hitboxes(self):
-        """AABB check of every active hitbox against every other fighter's hurtbox."""
+        """Checks every active hitbox circle against every other fighter's body (hurtbox)."""
         events = []
         for attacker in self.active_characters:
             if attacker.frozen:
@@ -831,7 +860,8 @@ class PhysicsEngine:
                     key = (target.id, box['gid'])
                     if target is attacker or not target.alive or key in attacker.hit_log:
                         continue
-                    if rect.colliderect(target.rect):
+                    body = target.rect
+                    if any(self.circle_hits_rect(x, y, r, body) for x, y, r in self.hitbox_circles(attacker, box)):
                         attacker.hit_log.add(key)
                         events.append((attacker, box, target))
         for attacker, box, target in events:             # resolved together so two attacks can trade
@@ -1648,6 +1678,7 @@ SPR, SPR_CX, SPR_FEET = 340, 170, 262
 HIP_K, SH_K, HEAD_K = 0.43, 0.73, 0.15     # body proportions: hip height, shoulder height, head radius (x fighter height)
 OUTLINE = (22, 14, 34)
 MAUL_SLOTS = {'fsmash', 'usmash', 'dsmash', 'utilt', 'fair', 'bair', 'uair', 'nair'}   # Bronn swings his maul
+THRUSTS = {'jab', 'fair', 'dash', 'nspecial', 'sspecial', 'grab'}                        # Kai stabs rather than slashes
 
 
 def glow(surf, color, pos, radius, alpha):
@@ -1712,26 +1743,62 @@ def target_pose(spec, key, t, info=None):
             P['sh'][1] -= b
             P['hf'], P['hb'] = [w * 0.5, shy + h * 0.06 - b], [w * 0.22, shy + h * 0.12 - b]
     elif key == 'run':
-        a = t * 0.36
-        s_, c_ = math.sin(a), math.cos(a)
-        S = w * 0.62
-        P['ff'] = [S * s_, -max(0.0, c_) * h * 0.13]
-        P['fb'] = [-S * s_, -max(0.0, -c_) * h * 0.13]
-        P['hf'] = [-S * 0.7 * s_ + w * 0.1, shy + h * 0.22 - abs(s_) * 3]      # arms swing opposite the legs
-        P['hb'] = [S * 0.7 * s_ - w * 0.1, shy + h * 0.22 - abs(s_) * 3]
-        P['sh'] = [h * 0.11, shy + 2 - abs(c_) * 2]
-        P['hip'][1] = hipy + 2 - abs(c_) * 2
-        P['wp'] = -0.3
+        # A real gait: each foot is planted (and slides back exactly as fast as the body moves forward, so it
+        # never skates), then lifts and swings through. The cycle is driven by distance travelled, not time.
+        ph = info.get('stride', (t * 0.045) % 1.0)
+        k = info.get('runk', 1.0)                             # 0 = walking, 1 = full sprint
+        S, lift = stride_half(w, k), h * (0.06 + 0.12 * k)
+
+        def foot(q):
+            if q < 0.5:                                       # planted
+                return [S * (1 - 4 * q), 0.0]
+            u = (q - 0.5) * 2                                 # swinging through
+            e = u * u * (3 - 2 * u)
+            return [S * (-1 + 2 * e), -lift * math.sin(math.pi * u) - h * 0.02 * k * math.sin(math.pi * u)]
+
+        P['ff'], P['fb'] = foot(ph), foot((ph + 0.5) % 1.0)
+        bob = (0.5 + 0.5 * math.cos(4 * math.pi * ph)) * h * (0.02 + 0.035 * k)    # lowest as each foot lands
+        lean = h * (0.03 + 0.11 * k)
+        P['hip'] = [lean * 0.3, hipy + bob]
+        P['sh'] = [lean, shy + bob * 1.15]
+        P['head'] = [lean * 0.15, 0.0]
+        sw = math.cos(2 * math.pi * ph)                       # arms swing opposite the legs
+        A = w * (0.22 + 0.32 * k)
+        P['hf'] = [lean + w * 0.06 - A * sw, shy + h * 0.25 + bob - abs(sw) * h * 0.04 * k]
+        P['hb'] = [lean - w * 0.06 + A * sw, shy + h * 0.25 + bob - abs(sw) * h * 0.04 * k]
+        P['wp'] = -0.3 + 0.4 * sw
+        P['gait'] = (sw, bob)
     elif key == 'jump':
-        P['ff'], P['fb'] = [w * 0.22, -h * 0.16], [-w * 0.3, -h * 0.05]
-        P['hf'], P['hb'] = [w * 0.38, shy - h * 0.08], [-w * 0.36, shy + h * 0.02]
-        P['wp'] = -1.2
+        r = clamp(-info.get('vy', -8.0) / 12.0, 0.0, 1.0)     # 1 = just took off, 0 = top of the jump
+        P['ff'] = [w * (0.18 + 0.08 * r), -h * (0.06 + 0.17 * r)]
+        P['fb'] = [-w * (0.30 - 0.1 * r), -h * (0.02 + 0.1 * r)]
+        P['hf'] = [w * (0.36 - 0.1 * r), shy - h * (0.02 + 0.12 * r)]
+        P['hb'] = [-w * (0.34 - 0.08 * r), shy + h * (0.06 - 0.1 * r)]
+        P['sh'][0] = h * 0.03 * r
+        P['wp'] = -1.2 - 0.3 * r
     elif key in ('fall', 'helpless'):
+        r = clamp(info.get('vy', 4.0) / 10.0, 0.0, 1.0)       # legs reach down for the ground as the fall speeds up
         wig = math.sin(t * 0.5) * 4 if key == 'helpless' else 0
-        P['ff'], P['fb'] = [w * 0.3, -h * 0.03], [-w * 0.26, -h * 0.1]
-        P['hf'], P['hb'] = [w * 0.5 + wig, shy - h * 0.14], [-w * 0.5 - wig, shy - h * 0.12]
+        P['ff'] = [w * (0.28 - 0.06 * r), -h * (0.08 - 0.06 * r)]
+        P['fb'] = [-w * (0.24 + 0.04 * r), -h * (0.14 - 0.06 * r)]
+        P['hf'] = [w * 0.5 + wig, shy - h * (0.04 + 0.12 * r)]
+        P['hb'] = [-w * 0.5 - wig, shy - h * (0.02 + 0.12 * r)]
         P['sh'][0] = -2 if key == 'fall' else -h * 0.06
-        P['wp'] = -1.5
+        P['wp'] = -1.3 - 0.3 * r
+    elif key == 'tuck':                                       # double-jump flip / roll: curled into a ball
+        P['hip'] = [0.0, hipy - h * 0.06]
+        P['sh'] = [h * 0.12, shy + h * 0.1]
+        P['head'] = [3.0, 4.0]
+        P['ff'], P['fb'] = [w * 0.3, -h * 0.34], [w * 0.08, -h * 0.28]
+        P['hf'], P['hb'] = [w * 0.36, shy + h * 0.3], [w * 0.2, shy + h * 0.32]
+        P['wp'] = 1.9
+    elif key == 'land':                                       # absorbing a landing
+        P['hip'] = [0.0, hipy + h * 0.1]
+        P['sh'] = [h * 0.08, shy + h * 0.13]
+        P['head'] = [1.0, 2.0]
+        P['ff'], P['fb'] = [w * 0.42, 0.0], [-w * 0.4, 0.0]
+        P['hf'], P['hb'] = [w * 0.52, shy + h * 0.3], [-w * 0.34, shy + h * 0.28]
+        P['wp'] = 0.5
     elif key == 'hurt':
         P['sh'] = [-h * 0.13, shy + 2]
         P['head'] = [-3.0, 2.0]
@@ -1792,7 +1859,39 @@ def target_pose(spec, key, t, info=None):
         n = math.hypot(tx - sx, ty - sy) or 1
         dx, dy = (tx - sx) / n, (ty - sy) / n
         ang = math.atan2(dy, dx)
-        if limb == 'hand':
+        mode = info.get('swing')
+        if limb == 'hand' and mode:
+            # Weapon attacks: the arm and weapon move as one line from the shoulder. The reach is chosen so the
+            # weapon passes right through the hitbox circle, and it sweeps across it during the active frames.
+            L, sp = info.get('wlen', 50), info.get('sprog', 0.0)
+            reach = clamp(n - L * 0.62, h * 0.18, h * 0.38)
+            P['hb'] = [-dx * w * 0.4, shy + h * 0.22]
+            if mode == 'thrust':
+                wp = ang
+                hand_r = {'wind': 0.45, 'strike': 0.8 + 0.2 * min(1.0, sp * 2.5)}.get(ph, 0.7) * reach
+                if ph == 'wind':
+                    P['sh'][0] -= dx * h * 0.06
+                    P['hip'][0] -= dx * h * 0.03
+                elif ph == 'strike':                          # lunge into it
+                    P['sh'] = [sx + dx * h * 0.12, sy + max(0.0, dy) * h * 0.08]
+                    P['hip'][0] += dx * h * 0.05
+                    P['ff'][0] += w * 0.22 * (1 if dx > 0 else 0)
+            else:
+                sweep = info.get('sweep', 1.3)
+                a0, a1 = ang - sweep, ang + sweep * 0.85
+                if ph == 'wind':                              # cocked back, ready
+                    wp, hand_r = a0 - 0.4, reach * 0.8
+                    P['sh'][0] -= dx * h * 0.05
+                elif ph == 'strike':                          # fastest as it crosses the circle, mid-way through the hit
+                    wp, hand_r = a0 + (a1 - a0) * (sp * sp * (3 - 2 * sp)), reach
+                    P['sh'] = [sx + dx * h * 0.08, sy + max(0.0, dy) * h * 0.06]
+                    P['hip'][0] += dx * h * 0.04
+                    P['ff'][0] += w * 0.14 * (1 if dx > 0 else 0)
+                else:                                         # follow-through
+                    wp, hand_r = a1 + 0.15, reach * 0.85
+            P['hf'] = [sx + math.cos(wp) * hand_r, sy + math.sin(wp) * hand_r]
+            P['wp'] = wp
+        elif limb == 'hand':
             P['hb'] = [-dx * w * 0.4, shy + h * 0.2]
             if ph == 'wind':                                  # pull back, away from the target
                 P['hf'] = [sx - dx * h * 0.24, sy - dy * h * 0.24 - h * 0.08]
@@ -1834,15 +1933,16 @@ def target_pose(spec, key, t, info=None):
                 P['head'] = [0.0, -2.0]
             P['wp'] = -1.57
         elif limb == 'slam':
-            if ph == 'wind':                                  # raise both arms overhead
-                P['hf'], P['hb'] = [w * 0.2, shy - h * 0.32], [w * 0.0, shy - h * 0.3]
-                P['sh'][1] -= 3
-                P['wp'] = -1.6
-            else:                                             # drive them into the ground
-                P['hf'], P['hb'] = [w * 0.6, -h * 0.06], [w * 0.38, -h * 0.04]
+            if ph == 'wind':                                  # raise both arms (and the hammer) overhead
+                P['hf'], P['hb'] = [w * 0.05, shy - h * 0.3], [-w * 0.05, shy - h * 0.28]
+                P['sh'] = [-h * 0.04, shy - 3]
+                P['wp'] = -2.3
+            else:                                             # drive it into the ground in front
+                P['hf'], P['hb'] = [w * 0.36, -h * 0.34], [w * 0.22, -h * 0.32]
                 P['sh'] = [h * 0.13, shy + h * 0.17]
                 P['hip'][1] += h * 0.08
-                P['wp'] = 1.2
+                P['ff'][0] += w * 0.1
+                P['wp'] = 0.42
         elif limb == 'cast':
             if ph == 'wind':
                 P['hf'] = [-w * 0.25, shy + h * 0.08]
@@ -1852,11 +1952,23 @@ def target_pose(spec, key, t, info=None):
                 P['sh'][0] += h * 0.06
                 P['wp'] = 0.0
     # ---- character-specific habits
-    if style == 'weaver' and key == 'run':                    # blade trails behind in a low runner's carry
-        P['hf'], P['wp'] = [-w * 0.45, shy + h * 0.3], 2.7
-    elif style == 'sentinel' and key in ('idle', 'run', 'jump', 'fall', 'shield', 'parry'):
-        P['hf'] = [w * 0.44, shy + h * 0.2]                   # shield always held out front
-        P['hb'] = [-w * 0.34, shy - h * 0.02 + (math.sin(t * 0.36) * 2 if key == 'run' else 0)]   # hammer hand raised
+    gait = P.pop('gait', None)
+    if style == 'weaver':
+        if key == 'run':                                      # blade swings back in a runner's carry
+            P['wp'] = 2.45 + 0.25 * gait[0]
+        elif key == 'idle':                                   # duelist's guard: blade low and forward
+            P['hf'] = [w * 0.46, shy + h * 0.2 + br * 1.5]
+            P['hb'] = [-w * 0.18, shy + h * 0.06]
+            P['ff'], P['fb'] = [w * 0.36, 0.0], [-w * 0.36, 0.0]
+            P['wp'] = -0.55 + br * 0.05
+    elif style == 'sentinel' and key in ('idle', 'run', 'jump', 'fall', 'shield', 'parry', 'land'):
+        bob = gait[1] if gait else 0.0
+        P['hf'] = [w * 0.44 + (P['sh'][0] if key == 'run' else 0), shy + h * 0.2 + bob]     # shield held out front
+        P['hb'] = [-w * 0.34 + (P['sh'][0] if key == 'run' else 0), shy - h * 0.02 + bob]  # hammer hand raised
+    elif style == 'kindled' and key == 'run':                 # fists up in a boxer's guard, pumping
+        sw, bob = gait
+        P['hf'] = [P['sh'][0] + w * 0.42 + sw * w * 0.08, shy + h * 0.06 + bob]
+        P['hb'] = [P['sh'][0] + w * 0.22 - sw * w * 0.08, shy + h * 0.1 + bob]
     elif style == 'voidcaller':
         if key == 'run':
             P['hf'], P['hb'] = [-w * 0.2, shy + h * 0.26], [-w * 0.55, shy + h * 0.2]
@@ -1866,6 +1978,11 @@ def target_pose(spec, key, t, info=None):
         strike = key == 'attack' and info.get('limb') == 'hand' and info.get('phase') == 'strike'
         P['orb'] = list(info['T']) if strike else [P['hf'][0] + 9, P['hf'][1] - 9]
     return P
+
+
+def stride_half(w, k):
+    """Half the length of a step: longer when sprinting (k=1) than walking (k=0)."""
+    return w * (0.34 + 0.3 * k)
 
 
 def blend_pose(cur, tgt, rate):
@@ -2119,6 +2236,18 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         if scar:
             line(lerp_color(skin, dark, 0.5), (fc[0] + hr * 0.0, fc[1] + hr * 0.3), (fc[0] + hr * 0.34, fc[1] + hr * 0.14), 1.2)
 
+    smear = info.get('smear')
+    if smear is not None:
+        L, a0, a1 = info.get('wlen', 50) + 6, smear, P['wp']
+        hand = hf if style != 'sentinel' or info.get('weapon') == 'maul' else hb_
+        n_ = 10
+        outer = [(hand[0] + math.cos(a0 + (a1 - a0) * q / n_) * L, hand[1] + math.sin(a0 + (a1 - a0) * q / n_) * L)
+                 for q in range(n_ + 1)]
+        inner = [(hand[0] + math.cos(a0 + (a1 - a0) * q / n_) * L * 0.3, hand[1] + math.sin(a0 + (a1 - a0) * q / n_) * L * 0.3)
+                 for q in range(n_ + 1)]
+        poly((*lerp_color(acc, WHITE, 0.5), 120), outer + inner[::-1])
+        line((255, 255, 255, 170), outer[-1], outer[len(outer) // 2], 2)
+
     if style == 'weaver':
         # ---------------- KAI: spiky-haired duelist, tattered scarf and tunic, broad steel blade
         hairc, bandc = col.get('hair', dark), col.get('band', acc)
@@ -2177,20 +2306,36 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         bands(ef, hf, wrap_lo, (0.25, 0.45, 0.65, 0.85), aw / 2)
         bx, by = math.cos(P['wp']), math.sin(P['wp'])
         nx_, ny_ = -by, bx
-        tip = (hf[0] + bx * 52, hf[1] + by * 52)
-        ribbon(chain('thread', (hf[0] - bx * 8, hf[1] - by * 8), 6, 6, 0.25, 0.9, 0.5), acc, 1.5, 1)
-        opoly((150, 158, 176), [(hf[0] + nx_ * 4.2, hf[1] + ny_ * 4.2), (hf[0] - nx_ * 4.2, hf[1] - ny_ * 4.2),
-                                (hf[0] + bx * 42 - nx_ * 3.2, hf[1] + by * 42 - ny_ * 3.2), tip,
-                                (hf[0] + bx * 42 + nx_ * 3.2, hf[1] + by * 42 + ny_ * 3.2)])           # a short, broad blade
-        poly((226, 232, 242), [(hf[0] + nx_ * 3.4, hf[1] + ny_ * 3.4), (hf[0] + nx_ * 0.4, hf[1] + ny_ * 0.4),
-                               (hf[0] + bx * 49, hf[1] + by * 49), (hf[0] + bx * 42 + nx_ * 2.4, hf[1] + by * 42 + ny_ * 2.4)])
-        line((96, 102, 122), (hf[0] + bx * 4, hf[1] + by * 4), (hf[0] + bx * 44, hf[1] + by * 44), 1)     # fuller
-        g_ = 20 + 16 * math.sin(t * 0.09)
-        C(WHITE, (hf[0] + bx * g_ + nx_ * 2, hf[1] + by * g_ + ny_ * 2), 1.5)                # glint
-        line(INK, (hf[0] + bx * 3 - by * 10, hf[1] + by * 3 + bx * 10), (hf[0] + bx * 3 + by * 10, hf[1] + by * 3 - bx * 10), 5.5)
-        line((120, 126, 146), (hf[0] + bx * 3 - by * 9, hf[1] + by * 3 + bx * 9), (hf[0] + bx * 3 + by * 9, hf[1] + by * 3 - bx * 9), 3.2)
-        line((110, 76, 52), (hf[0] - bx * 7, hf[1] - by * 7), (hf[0] + bx * 1, hf[1] + by * 1), 3.5)
-        oC((176, 182, 198), (hf[0] - bx * 9, hf[1] - by * 9), 2.6, hl=False)                 # pommel ring
+        BL = 52                                                                              # a slim, slightly curved sabre
+
+        def bpt(u, side):                                                                    # point along the blade
+            curve = 3.2 * math.sin(math.pi * u * 0.9)                                        # the edge bows forward
+            half = (4.0 * (1 - u) + 0.8) * side
+            d = 6 + (BL - 6) * u
+            return (hf[0] + bx * d + nx_ * (curve + half), hf[1] + by * d + ny_ * (curve + half))
+
+        ribbon(chain('thread', (hf[0] - bx * 9, hf[1] - by * 9), 6, 6, 0.25, 0.9, 0.5), acc, 1.6, 1)   # the golden thread
+        spine = [bpt(u / 8, -1) for u in range(9)]
+        edge = [bpt(u / 8, 1) for u in range(9)]
+        opoly((128, 136, 156), spine + edge[::-1])
+        poly((222, 228, 240), [bpt(u / 8, 0.15) for u in range(9)] + edge[::-1])            # the polished edge
+        line((90, 96, 116), bpt(0.05, -0.3), bpt(0.72, -0.3), 1)                             # fuller
+        if striking:                                                                         # a glint runs down the edge
+            g_ = (t * 0.25) % 1.0
+            C(WHITE, bpt(g_, 0.5), 2.2)
+        else:
+            C(WHITE, bpt(0.4 + 0.3 * math.sin(t * 0.06), 0.4), 1.4)
+        gl, gr = (hf[0] + bx * 5 - nx_ * 9, hf[1] + by * 5 - ny_ * 9), (hf[0] + bx * 5 + nx_ * 9, hf[1] + by * 5 + ny_ * 9)
+        line(INK, gl, gr, 6.5)                                                               # crossguard
+        line(acc, gl, gr, 4)
+        oC(acc, gl, 2.4, hl=False)
+        oC(acc, gr, 2.4, hl=False)
+        line(INK, (hf[0] - bx * 9, hf[1] - by * 9), (hf[0] + bx * 3, hf[1] + by * 3), 5.5)   # grip
+        line((120, 34, 40), (hf[0] - bx * 9, hf[1] - by * 9), (hf[0] + bx * 3, hf[1] + by * 3), 3.4)
+        for k in (-6, -2.5, 1):
+            line(lerp_color(acc, INK, 0.2), (hf[0] + bx * k - nx_ * 1.7, hf[1] + by * k - ny_ * 1.7),
+                 (hf[0] + bx * (k + 1.6) + nx_ * 1.7, hf[1] + by * (k + 1.6) + ny_ * 1.7), 1)
+        oC((190, 196, 210), (hf[0] - bx * 10.5, hf[1] - by * 10.5), 2.6, hl=False)          # pommel ring
         oC(skin, hf, 4.4, hl=False)
 
     elif style == 'sentinel':
@@ -2215,6 +2360,13 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
             poly(lerp_color(stone, INK, 0.35), [blk[2], blk[3], (end[0] - bx * 9 - by * 23, end[1] - by * 9 + bx * 23),
                                                 (end[0] - bx * 9 + by * 23, end[1] - by * 9 - bx * 23)])
             poly(INK, blk, 1.4)
+            for f_ in (-17, 17):                                                              # iron bands on the head
+                band = [(end[0] + bx * 16 + by * (f_ - 3), end[1] + by * 16 - bx * (f_ - 3)),
+                        (end[0] + bx * 16 + by * (f_ + 3), end[1] + by * 16 - bx * (f_ + 3)),
+                        (end[0] - bx * 16 + by * (f_ + 3), end[1] - by * 16 - bx * (f_ + 3)),
+                        (end[0] - bx * 16 + by * (f_ - 3), end[1] - by * 16 - bx * (f_ - 3))]
+                opoly((92, 96, 112), band, 0.8)
+                C((170, 176, 192), (end[0] + bx * 11 + by * f_, end[1] + by * 11 - bx * f_), 1.4)
             opoly((78, 82, 98), [(end[0] + bx * 8, end[1] + by * 8), (end[0] - by * 7, end[1] + bx * 7),
                                  (end[0] - bx * 8, end[1] - by * 8), (end[0] + by * 7, end[1] - bx * 7)], 0.8)   # emblem
             line(INK, (end[0] + bx * 5 - by * 21, end[1] + by * 5 + bx * 21), (end[0] - bx * 5 - by * 13, end[1] - by * 5 + bx * 13), 1.1)
@@ -2397,6 +2549,10 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         orb = P.get('orb', hf)
         if math.hypot(orb[0] - hf[0], orb[1] - hf[1]) > 16:
             line(acc, hf, orb, 1)
+            for q in range(1, 6):                                                             # a trail of stardust
+                u = q / 6
+                p_ = (hf[0] + (orb[0] - hf[0]) * u, hf[1] + (orb[1] - hf[1]) * u + math.sin(t * 0.4 + q) * 3)
+                poly(lerp_color(acc, WHITE, u), star_points(p_[0], p_[1], 1.5 + 2.5 * u, t * 0.2 + q))
         pulse = 1 + 0.15 * math.sin(t * 0.2)
         halo(acc, orb, 20 * pulse, 170)
         C(INK, orb, 11.5 * pulse)
@@ -2542,120 +2698,94 @@ def flame(surf, base, d, length, width, cols):
             (base[0] + px * W / 2, base[1] + py * W / 2)])
 
 
-def draw_attack_fx(surf, c, box, r, frame):
-    """Draws one active hitbox in the style of the fighter who owns it."""
+def draw_attack_fx(surf, c, box, circles, frame):
+    """Draws an active hitbox exactly where it is: each hitbox circle is shown at its true size as a disc in
+    the fighter's colour with a bright rim, with that fighter's own flourish inside it
+    (a blade crescent for Kai, cracked stone for Bronn, stars for Nyx, flames for Rhea)."""
     style, acc, main = c.spec['style'], c.colors['accent'], c.colors['main']
     span = max(1, box['end'] - box['start'] + 1)
     prog = clamp((c.move_frame - box['start'] + 1) / span, 0.0, 1.0)
-    px, py = c.x, c.y - c.h * 0.62                           # shoulder pivot
-    cx, cy = r.center
-    centered = abs(cx - c.x) < 18 and abs(cy - (c.y - c.h / 2)) < 18
-    low = box['radial'] and box['rect'][1] > 18              # ground-hugging shockwaves
-    n = math.hypot(cx - px, cy - py) or 1
-    d = ((cx - px) / n, (cy - py) / n)
-    ang = math.atan2(d[1], d[0])
-    reach = n + max(r.w, r.h) * 0.45
-    slot = c.current_move.slot if c.current_move else ''
-    D = pygame.draw
-    if box['grab']:                                          # a snatching hand: two closing brackets
-        for sgn in (-1, 1):
-            off = (1 - prog) * 10 + 6
-            D.lines(surf, WHITE, False, [(cx - c.facing * 8, cy + sgn * (r.h / 2 + off)),
-                                         (cx + c.facing * 10, cy + sgn * off),
-                                         (cx - c.facing * 8, cy + sgn * 2)], 4)
-        return
-    if style == 'weaver':
-        if centered and box['radial']:                       # Aether Burst: a ring of snapped threads
-            rad = r.w / 2 * (0.4 + 0.6 * prog)
-            D.circle(surf, acc, (cx, cy), int(rad), 5)
-            D.circle(surf, WHITE, (cx, cy), int(rad * 0.82), 2)
-            for i in range(14):
-                a = i * math.tau / 14 + frame * 0.05
-                D.line(surf, WHITE if i % 2 else acc, (cx + math.cos(a) * rad * 0.35, cy + math.sin(a) * rad * 0.35),
-                       (cx + math.cos(a) * rad * 1.05, cy + math.sin(a) * rad * 1.05), 2)
-        elif centered:                                       # spinning blade: a full circle of steel
-            a0 = frame * 0.9
-            slash_arc(surf, (cx, cy), max(r.w, r.h) / 2, a0, a0 + math.tau * 0.8, 16, acc, WHITE)
-        else:                                                # crescent slash following the blade
-            sweep = 1.05 * c.facing
-            a_end = ang - sweep + 2 * sweep * min(1.0, prog * 1.4 + 0.25)
-            slash_arc(surf, (px, py), reach, ang - sweep, a_end, 12 + box['damage'] * 0.9, acc, WHITE)
-            tipx, tipy = px + math.cos(a_end) * reach, py + math.sin(a_end) * reach
-            D.line(surf, acc, (px + d[0] * 20, py + d[1] * 20), (tipx, tipy), 1)             # the thread
-    elif style == 'sentinel':
-        dark = c.colors['dark']
-        if low:                                              # Ground Slam: stone spikes erupt from the floor
-            cnt = max(3, r.w // 34)
-            ease = 1 - (1 - prog) ** 2
-            for i in range(cnt):
-                x = r.left + (i + 0.5) * r.w / cnt
-                k = 1 - abs(x - cx) / (r.w / 2) * 0.55
-                hgt = (r.h + 56) * k * ease
-                leanx = (x - cx) * 0.12
-                D.polygon(surf, STONE, [(x - 15, r.bottom), (x + 15, r.bottom), (x + leanx, r.bottom - hgt)])
-                D.polygon(surf, dark, [(x - 15, r.bottom), (x + 15, r.bottom), (x + leanx, r.bottom - hgt)], 2)
-                D.line(surf, acc, (x, r.bottom - 2), (x + leanx * 0.6, r.bottom - hgt * 0.6), 2)
-        elif centered:                                       # Rolling Boulder
-            a0 = frame * 0.6
-            slash_arc(surf, (cx, cy), max(r.w, r.h) / 2 + 4, a0, a0 + math.tau * 0.7, 18, STONE, acc)
-        elif slot in MAUL_SLOTS:                             # maul: a short, heavy arc ending in an impact
-            sweep = 0.7 * c.facing
-            slash_arc(surf, (px, py), reach, ang - sweep, ang - sweep + 2 * sweep * min(1.0, prog * 1.5 + 0.2),
-                      24, STONE, acc)
-            if prog > 0.45:
-                for i in range(6):
-                    a = i * math.tau / 6 + 0.3
-                    D.line(surf, acc, (cx + math.cos(a) * 14, cy + math.sin(a) * 14),
-                           (cx + math.cos(a) * (26 + prog * 16), cy + math.sin(a) * (26 + prog * 16)), 4)
-        else:                                                # shield / body blows: chevron shockwaves
-            hh = r.h * 0.42
-            for i in range(3):
-                off = (i - 1) * 16 + prog * 18
-                bx, by = cx + d[0] * off, cy + d[1] * off
-                D.lines(surf, acc if i < 2 else WHITE, False, [
-                    (bx - d[0] * 12 - d[1] * hh, by - d[1] * 12 + d[0] * hh),
-                    (bx + d[0] * 6, by + d[1] * 6),
-                    (bx - d[0] * 12 + d[1] * hh, by - d[1] * 12 - d[0] * hh)], 7 - i * 2)
-    elif style == 'voidcaller':
-        rng = random.Random(hash(slot) + box['gid'] * 13)
-        glow(surf, acc, (cx, cy), max(r.w, r.h) * 0.45, 70)
-        if low or centered:                                  # rings of orbiting stars
-            rect = r.inflate(-10, 0) if low else r
-            D.ellipse(surf, acc, rect, 3)
-            for i in range(8):
-                a = i * math.tau / 8 + frame * 0.18
-                sx_, sy_ = rect.centerx + math.cos(a) * rect.w / 2, rect.centery + math.sin(a) * rect.h / 2
-                D.polygon(surf, WHITE, star_points(sx_, sy_, 7 + 3 * math.sin(frame * 0.5 + i), frame * 0.1))
-        else:                                                # a constellation snaps into being
-            pts = [(r.left + r.w * (0.1 + 0.8 * (i + rng.random() * 0.6) / 6),
-                    r.top + r.h * rng.uniform(0.12, 0.88)) for i in range(6)]
-            shown = max(2, int(len(pts) * min(1.0, prog * 1.5 + 0.3)))
-            D.lines(surf, acc, False, pts[:shown], 2)
-            for i, p in enumerate(pts[:shown]):
-                D.polygon(surf, WHITE, star_points(p[0], p[1], 7 + 3 * math.sin(frame * 0.6 + i * 2), frame * 0.12))
-                D.circle(surf, acc, (int(p[0]), int(p[1])), 3)
-    else:                                                    # kindled: living fire
-        cols = ((255, 96, 24), acc, (255, 250, 225))
-        jit = random.Random(frame * 7 + box['gid'])
-        if low:                                              # Magma Stomp: flames race along the ground
-            cnt = max(4, r.w // 26)
-            for i in range(cnt):
-                x = r.left + (i + 0.5) * r.w / cnt
-                k = 1 - abs(x - cx) / (r.w / 2) * 0.5
-                flame(surf, (x, r.bottom), (0.0, -1.0), (r.h + 50) * k * jit.uniform(0.6, 1.1), 22, cols)
-        elif centered:                                       # fire wheel / ignition burst
-            rad = max(r.w, r.h) * 0.2
-            for i in range(9):
-                a = i * math.tau / 9 + frame * 0.5
-                flame(surf, (cx + math.cos(a) * rad, cy + math.sin(a) * rad), (math.cos(a + 0.6), math.sin(a + 0.6)),
-                      max(r.w, r.h) * 0.36 * jit.uniform(0.8, 1.2), 20, cols)
-        else:                                                # fire trails off the fist or foot
-            ext = (abs(d[0]) * r.w + abs(d[1]) * r.h)
-            base = (cx - d[0] * ext * 0.3, cy - d[1] * ext * 0.3)
-            for i in range(3):
-                off = (i - 1) * max(r.w * abs(d[1]), r.h * abs(d[0])) * 0.24
-                b = (base[0] - d[1] * off, base[1] + d[0] * off)
-                flame(surf, b, d, ext * (0.95 - abs(i - 1) * 0.25) * jit.uniform(0.8, 1.1), 22 - abs(i - 1) * 6, cols)
+    fade = 1.0 - 0.45 * prog
+    bx, by = c.x, c.y - c.h / 2                               # the fighter's body centre
+    for cx, cy, r in circles:
+        R = int(r)
+        if R < 2 or R > 1500:
+            continue
+        size = R * 2 + 8
+        s = pygame.Surface((size, size), pygame.SRCALPHA)
+        o = size // 2                                          # circle centre on the little surface
+        ang = math.atan2(cy - by, cx - bx) if abs(cx - bx) + abs(cy - by) > 4 else (0.0 if c.facing > 0 else math.pi)
+        D = pygame.draw
+        if box['grab']:                                        # a grab: a white snare ring closing in
+            D.circle(s, (255, 255, 255, int(70 * fade)), (o, o), R)
+            for k in range(8):
+                a0 = k * math.tau / 8 + frame * 0.15
+                pts = [(o + math.cos(a0 + q * 0.06) * R, o + math.sin(a0 + q * 0.06) * R) for q in range(6)]
+                D.lines(s, (255, 255, 255, 230), False, pts, 3)
+            surf.blit(s, (cx - o, cy - o))
+            continue
+        if box['spike']:                                       # spike spot: magenta, pointing down
+            D.circle(s, (255, 110, 255, 90), (o, o), R)
+            D.circle(s, (255, 190, 255, 235), (o, o), R, 2)
+            D.lines(s, WHITE, False, [(o - R * 0.5, o - R * 0.2), (o, o + R * 0.45), (o + R * 0.5, o - R * 0.2)], 2)
+            surf.blit(s, (cx - o, cy - o))
+            continue
+        D.circle(s, (*acc, int(80 * fade)), (o, o), R)                         # the hitbox itself
+        D.circle(s, (*lerp_color(acc, WHITE, 0.55), int(150 * fade)), (o, o), max(2, R - 3), max(1, R // 7))
+        if style == 'weaver':                                  # a blade crescent sweeping across the circle
+            sweep = 1.25
+            a0 = ang - sweep * c.facing
+            a1 = a0 + 2 * sweep * c.facing * min(1.0, prog * 1.6 + 0.2)
+            n = 14
+            outer = [(o + math.cos(a0 + (a1 - a0) * q / n) * (R - 2), o + math.sin(a0 + (a1 - a0) * q / n) * (R - 2))
+                     for q in range(n + 1)]
+            inner = [(o + math.cos(a0 + (a1 - a0) * q / n) * (R - 2 - R * 0.42 * math.sin(math.pi * q / n)) + R * 0.12 * math.cos(ang),
+                      o + math.sin(a0 + (a1 - a0) * q / n) * (R - 2 - R * 0.42 * math.sin(math.pi * q / n)) + R * 0.12 * math.sin(ang))
+                     for q in range(n + 1)]
+            D.polygon(s, (*lerp_color(acc, WHITE, 0.35), 235), outer + inner[::-1])
+            D.lines(s, (255, 255, 255, 255), False, outer, 2)
+            for k in range(3):                                 # loose golden threads
+                a = ang + (k - 1) * 0.7 + frame * 0.07
+                D.line(s, (*acc, 200), (o, o), (o + math.cos(a) * R * 0.85, o + math.sin(a) * R * 0.85), 1)
+        elif style == 'sentinel':                              # cracked stone and a shockwave
+            stone = c.colors.get('stone', (136, 142, 154))
+            D.circle(s, (*stone, int(120 * fade)), (o, o), int(R * (0.35 + 0.35 * prog)))
+            rng = random.Random(box['gid'] * 31 + int(cx) // 40)
+            for k in range(6):                                 # cracks running out to the rim
+                a = k * math.tau / 6 + rng.uniform(-0.3, 0.3)
+                mid_r = R * rng.uniform(0.35, 0.6)
+                p1 = (o + math.cos(a) * R * 0.15, o + math.sin(a) * R * 0.15)
+                p2 = (o + math.cos(a + 0.25) * mid_r, o + math.sin(a + 0.25) * mid_r)
+                p3 = (o + math.cos(a) * (R - 3), o + math.sin(a) * (R - 3))
+                D.lines(s, (30, 40, 60, 220), False, [p1, p2, p3], 2)
+                D.line(s, (*acc, 230), p2, p3, 1)
+            D.circle(s, (*acc, 240), (o, o), R, 3)
+        elif style == 'voidcaller':                            # a disc of night sky with stars on the rim
+            D.circle(s, (20, 10, 44, int(120 * fade)), (o, o), max(2, R - 4))
+            rng = random.Random(box['gid'] * 17 + 3)
+            for k in range(7):
+                a, d = rng.uniform(0, math.tau), rng.uniform(0.1, 0.75) * R
+                tw = 0.5 + 0.5 * math.sin(frame * 0.4 + k)
+                D.circle(s, (255, 255, 255, int(150 + 100 * tw)), (int(o + math.cos(a) * d), int(o + math.sin(a) * d)), 1 + (k % 2))
+            for k in range(5):
+                a = k * math.tau / 5 + frame * 0.12
+                D.polygon(s, (255, 255, 255, 245), star_points(o + math.cos(a) * (R - 3), o + math.sin(a) * (R - 3), 4 + R * 0.08, frame * 0.1))
+            D.circle(s, (*acc, 240), (o, o), R, 2)
+        else:                                                  # kindled: a ball of fire, tongues licking outward
+            D.circle(s, (240, 90, 20, int(130 * fade)), (o, o), max(2, R - 2))
+            D.circle(s, (255, 200, 80, int(170 * fade)), (o, o), int(R * 0.62))
+            D.circle(s, (255, 250, 220, int(200 * fade)), (o, o), int(R * 0.3))
+            rng = random.Random(frame * 7 + box['gid'])
+            for k in range(8):
+                a = k * math.tau / 8 + frame * 0.2
+                ln = R * rng.uniform(0.75, 0.98)
+                px, py = -math.sin(a), math.cos(a)
+                base = (o + math.cos(a) * R * 0.35, o + math.sin(a) * R * 0.35)
+                D.polygon(s, (255, 150, 40, 230), [(base[0] - px * R * 0.16, base[1] - py * R * 0.16),
+                                                   (o + math.cos(a) * ln, o + math.sin(a) * ln),
+                                                   (base[0] + px * R * 0.16, base[1] + py * R * 0.16)])
+            D.circle(s, (255, 230, 120, 240), (o, o), R, 2)
+        surf.blit(s, (cx - o, cy - o))
 
 
 def draw_death_ray(surf, c):
@@ -2984,16 +3114,66 @@ class StateTranslator:
         s, e = min(b['start'] for b in boxes), max(b['end'] for b in boxes)
         live = [b for b in boxes if b['start'] <= f <= b['end']]
         box = max(live, key=lambda b: b['rect'][2] * b['rect'][3]) if live else boxes[0]
-        info.update(limb=attack_limb(style, box), T=(box['rect'][0], -c.h / 2 + box['rect'][1]),
+        limb = attack_limb(style, box)
+        if style == 'sentinel' and weapon == 'maul' and limb not in ('spin', 'burst', 'slam'):
+            limb = 'hand'                                     # the hammer does the work, not a kick
+        info.update(limb=limb, T=(box['rect'][0], -c.h / 2 + box['rect'][1]),
                     phase='wind' if f < s else 'strike' if f <= e + 2 else 'recover',
+                    sprog=clamp((f - s + 1) / (e - s + 2), 0.0, 1.0),
                     spin=-360.0 * clamp((f - s + 1) / (e - s + 2), 0.0, 1.0) * c.facing)
+        if limb == 'hand' and style == 'weaver':
+            info.update(swing='thrust' if m.slot in THRUSTS else 'swing', wlen=50, sweep=1.3)
+        elif limb == 'hand' and style == 'sentinel' and weapon == 'maul':
+            info.update(swing='swing', wlen=50, sweep=1.1)
         return info
+
+    def _track(self, c):
+        """Purely visual bookkeeping (never touches the game itself): how far the fighter has run (for the
+        stride), when they landed (crouch), double-jumped (flip) or started a roll."""
+        vs = c.__dict__.get('vis')
+        if vs is None:
+            vs = c.vis = dict(anim=c.anim, stride=0.0, runk=1.0, land=0, flip=0, roll=0, roll_dir=c.facing,
+                              ground=c.ground is not None, jumps=c.air_jumps, vy=0.0, wp=None)
+        dt = c.anim - vs['anim']
+        vs['anim'] = c.anim
+        if dt <= 0 or dt > 30:
+            return vs
+        grounded = c.ground is not None
+        if c.current_state == "RUNNING":
+            k = clamp((abs(c.vx) / max(0.1, c.speed) - 0.35) / 0.55, 0.0, 1.0)
+            vs['runk'] += (k - vs['runk']) * 0.2
+            vs['stride'] = (vs['stride'] + abs(c.vx) * dt / (4 * stride_half(c.w, vs['runk']))) % 1.0
+        if grounded and not vs['ground'] and c.current_state in ("IDLE", "RUNNING", "JUMPING"):
+            vs['land'] = 11 if vs['vy'] > 9 else 7
+        if grounded:
+            vs['jumps'] = c.air_jumps
+        elif c.jumps_left < vs['jumps']:                      # an air jump just happened
+            vs['jumps'] = c.jumps_left
+            if c.spec['style'] in ('weaver', 'kindled'):
+                vs['flip'] = 26
+        if c.current_state == "DODGE":
+            if vs['roll'] == 0:
+                vs['roll_dir'] = sign(c.vx) if abs(c.vx) > 1 else 0
+            vs['roll'] += dt
+        else:
+            vs['roll'] = 0
+        if c.current_state != "JUMPING":
+            vs['flip'] = 0
+        vs['land'] = max(0, vs['land'] - dt)
+        vs['flip'] = max(0, vs['flip'] - dt)
+        vs['ground'], vs['vy'] = grounded, c.vy + c.kby
+        return vs
 
     def _determine_visuals(self, character):
         c, state = character, character.current_state
         v = dict(sprite_key='idle', tint=None, outline=None, alpha=255, rotation=0, info={})
+        vs = c.__dict__.get('vis') or {}
         if state == "RUNNING":
             v['sprite_key'] = 'run'
+        elif state == "IDLE" and vs.get('land'):
+            v['sprite_key'] = 'land'
+        elif state == "JUMPING" and vs.get('flip'):
+            v.update(sprite_key='tuck', rotation=-360.0 * (1 - vs['flip'] / 26) * c.facing)
         elif state == "JUMPING":
             v['sprite_key'] = 'jump' if c.vy < 0 else 'fall'
         elif state == "ATTACKING" and c.current_move:
@@ -3017,7 +3197,10 @@ class StateTranslator:
         elif state == "PARRY_SUCCESS":
             v.update(sprite_key='parry', tint=(0, 255, 90, 110), outline=(0, 255, 90))
         elif state == "DODGE":
-            v.update(sprite_key='dodge', alpha=110)
+            if vs.get('roll_dir') and c.ground is not None:   # a roll: tumble across the floor
+                v.update(sprite_key='tuck', alpha=150, rotation=-360.0 * clamp(vs['roll'] / 22, 0, 1) * vs['roll_dir'])
+            else:
+                v.update(sprite_key='dodge', alpha=110)
         elif state == "LEDGE":
             v['sprite_key'] = 'ledge'
         elif state == "HELPLESS":
@@ -3048,10 +3231,16 @@ class StateTranslator:
         return v
 
     def sprite_for(self, c, v):
-        key, info = v['sprite_key'], v['info']
+        key, info = v['sprite_key'], dict(v['info'])
+        vs = c.__dict__.get('vis') or {}
+        info.update(stride=vs.get('stride', 0.0), runk=vs.get('runk', 1.0), vy=c.vy + c.kby)
         target = target_pose(c.spec, key, c.anim, info)
-        rate = 0.8 if info.get('phase') == 'strike' else 0.42
+        rate = 0.9 if info.get('phase') == 'strike' else 0.5 if key == 'run' else 0.42
+        prev_wp = c.pose.get('wp') if c.pose else None
         c.pose = target if c.pose is None else blend_pose(c.pose, target, rate)
+        if info.get('swing') == 'swing' and info.get('phase') == 'strike' and prev_wp is not None \
+                and abs(c.pose['wp'] - prev_wp) > 0.12:
+            info['smear'] = prev_wp                           # motion smear behind the swinging weapon
         name = c.name.lower()
         if self.assets.fighter(name):                        # this fighter has real artwork
             return self._art_sprite(c, name, key)
@@ -3131,6 +3320,8 @@ class StateTranslator:
 
     def update_visuals(self, surface, characters, physics, show_boxes=False):
         self.roster = list(characters.values())
+        for c in self.roster:
+            self._track(c)
         for c in characters.values():
             if c.current_state == "KO":
                 continue
@@ -3173,13 +3364,9 @@ class StateTranslator:
             if c.current_move is DEATH_RAY:
                 draw_death_ray(surface, c)
             else:
-                for box in physics.active_hitboxes(c):          # weapon trails, flames, constellations...
-                    r = physics.hitbox_rect(c, box)
-                    if box['spike']:                            # a small glint marks the spike spot
-                        pygame.draw.lines(surface, (255, 160, 255), False,
-                                          [(r.left, r.centery - 5), (r.centerx, r.bottom), (r.right, r.centery - 5)], 3)
-                    elif not (self.assets.has(c.name.lower(), c.current_move.slot) and self.art_window(c)):
-                        draw_attack_fx(surface, c, box, r, physics.frame)
+                for box in physics.active_hitboxes(c):          # every hitbox is drawn at its true size
+                    if not (self.assets.has(c.name.lower(), c.current_move.slot) and self.art_window(c)):
+                        draw_attack_fx(surface, c, box, physics.hitbox_circles(c, box), physics.frame)
             cx, cy = c.center
             if c.current_state == "SHIELD" and not self.assets.has(c.name.lower(), 'shield'):
                 rad = int((c.h * 0.42 + 14) * (0.55 + 0.45 * c.shield_hp / SHIELD_MAX))
@@ -3196,9 +3383,9 @@ class StateTranslator:
             if show_boxes:
                 pygame.draw.rect(surface, (0, 255, 0), c.rect, 2)
                 for box in physics.active_hitboxes(c):
-                    if box['rect'][2] < 1000:
-                        pygame.draw.rect(surface, (255, 0, 255) if box['spike'] else (255, 0, 0),
-                                         physics.hitbox_rect(c, box), 2)
+                    for x, y, r in physics.hitbox_circles(c, box):
+                        if r < 1000:
+                            pygame.draw.circle(surface, (255, 0, 255) if box['spike'] else (255, 0, 0), (int(x), int(y)), int(r), 2)
 
 
 # =====================================================================
@@ -3263,6 +3450,27 @@ def game_version():
 
 
 GAME_VERSION = game_version()
+
+
+def bundled_text(name):
+    """A small text file packed into the .exe at build time (or sitting next to the script)."""
+    for folder in (getattr(sys, '_MEIPASS', None), os.path.dirname(os.path.abspath(__file__))):
+        try:
+            with open(os.path.join(folder, name), encoding='utf-8') as fh:
+                return fh.read().strip()
+        except (OSError, TypeError):
+            pass
+    return ""
+
+
+DEFAULT_SERVER = bundled_text('server.txt')      # the lobby server baked into the build (may be empty)
+
+
+def split_address(text):
+    host, _, port = text.strip().rpartition(':')
+    if not host:
+        host, port = text.strip(), str(DEFAULT_PORT)
+    return (host, int(port)) if host and port.isdigit() else None
 
 
 def encode_input(inp):
@@ -3363,58 +3571,109 @@ class OnlineClient:
 
 
 class Updater:
-    """Keeps the packaged game up to date: on start it asks GitHub for the newest release and, if this copy
-    is older, downloads the new AetherClash.exe, swaps it in and restarts. Only runs in the packaged .exe."""
-    def __init__(self):
-        self.status, self.ready, self.exe = "", False, sys.executable
-        if getattr(sys, 'frozen', False) and GAME_VERSION != "dev":
-            try:
-                os.remove(self.exe + ".old")                 # left over from the previous update
-            except OSError:
-                pass
-            self.status = "Checking for updates..."
+    """Keeps the packaged game up to date. When the game opens it looks for a newer release - first on the
+    lobby server (which keeps a copy of the latest release, so this works while the GitHub repository is
+    private), then on GitHub itself. If one is found it downloads the new AetherClash.exe, checks it,
+    swaps it in and restarts into it. Runs only in the packaged game, never from source."""
+    def __init__(self, servers=()):
+        self.exe, self.servers = sys.executable, [s_ for s_ in servers if s_]
+        self.state, self.status, self.tag, self.progress = 'off', "", "", 0.0
+        self.enabled = getattr(sys, 'frozen', False) and (GAME_VERSION != "dev" or os.environ.get("AETHER_UPDATE_URL"))
+        if self.enabled:
+            for leftover in (self.exe + ".old", self.exe + ".new"):           # from the previous update
+                try:
+                    os.remove(leftover)
+                except OSError:
+                    pass
+            self.state, self.status = 'checking', "Checking for updates..."
             threading.Thread(target=self._run, daemon=True).start()
 
     @staticmethod
     def _num(tag):
-        return tuple(int(p) for p in tag.lstrip('v').split('.') if p.isdigit())
+        return tuple(int(p) for p in str(tag).lstrip('v').split('.') if p.isdigit())
+
+    @staticmethod
+    def _get(url, timeout):
+        req = urllib.request.Request(url, headers={"User-Agent": "AetherClash", "Accept": "application/vnd.github+json"})
+        return urllib.request.urlopen(req, timeout=timeout)
+
+    def _feeds(self):
+        """Every place a release might be found, as (feed URL, kind)."""
+        if os.environ.get("AETHER_UPDATE_URL"):
+            yield os.environ["AETHER_UPDATE_URL"], 'mirror'
+        for addr in self.servers:
+            hp = split_address(addr)
+            if hp:
+                yield f"http://{hp[0]}:{hp[1]}/aether/latest.json", 'mirror'
+        yield f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", 'github'
+
+    def _find(self):
+        for url, kind in self._feeds():
+            try:
+                with self._get(url, 4) as r:
+                    data = json.load(r)
+                if kind == 'mirror':
+                    return data.get('tag', ''), urllib.parse.urljoin(url, data['url']), data.get('sha256')
+                asset = next(a for a in data.get('assets', []) if a['name'].lower().endswith('.exe'))
+                digest = str(asset.get('digest') or '')
+                return data.get('tag_name', ''), asset['browser_download_url'], \
+                    digest.split(':', 1)[1] if digest.startswith('sha256:') else None
+            except Exception:                                 # unreachable, private, no release yet: try the next
+                continue
+        return None
 
     def _run(self):
         try:
-            req = urllib.request.Request(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest",
-                                         headers={"User-Agent": "AetherClash", "Accept": "application/vnd.github+json"})
-            with urllib.request.urlopen(req, timeout=8) as r:
-                rel = json.load(r)
-            tag = rel.get("tag_name", "")
-            if self._num(tag) <= self._num(GAME_VERSION):
-                self.status = f"Up to date ({GAME_VERSION})"
+            found = self._find()
+            if not found:
+                self.state, self.status = 'done', f"{GAME_VERSION}  (could not check for updates)"
                 return
-            url = next(a["browser_download_url"] for a in rel.get("assets", []) if a["name"].lower().endswith(".exe"))
-            self.status = f"Downloading update {tag}..."
-            with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "AetherClash"}), timeout=30) as r, \
-                    open(self.exe + ".new", "wb") as out:
-                total, done = int(r.headers.get("Content-Length", 0)), 0
+            tag, url, sha = found
+            if self._num(tag) <= self._num(GAME_VERSION):
+                self.state, self.status = 'done', f"Up to date  ({GAME_VERSION})"
+                return
+            self.tag, self.state, self.status = tag, 'downloading', f"Downloading update {tag}..."
+            digest = hashlib.sha256()
+            with self._get(url, 20) as r, open(self.exe + ".new", "wb") as out:
+                total, done = int(r.headers.get("Content-Length") or 0), 0
                 while True:
                     chunk = r.read(1 << 16)
                     if not chunk:
                         break
                     out.write(chunk)
+                    digest.update(chunk)
                     done += len(chunk)
                     if total:
+                        self.progress = done / total
                         self.status = f"Downloading update {tag}...  {done * 100 // total}%"
-            self.status, self.ready = f"Restarting into {tag}...", True
-        except Exception:                                    # offline, private repository, blocked: just carry on
-            self.status = f"{GAME_VERSION}  (update check unavailable)"
+            if (sha and digest.hexdigest() != sha.lower()) or (total and done != total) or done < 100_000:
+                os.remove(self.exe + ".new")
+                self.state, self.status = 'done', f"{GAME_VERSION}  (the update download was damaged; try again later)"
+                return
+            self.state, self.status = 'ready', f"Installing {tag}..."
+        except Exception:
+            self.state, self.status = 'done', f"{GAME_VERSION}  (update failed; try again later)"
 
     def apply(self):
-        """Swap the downloaded .exe in and relaunch. Windows lets a running .exe be renamed, not overwritten."""
+        """Swap the downloaded .exe in and start it. Windows lets a running .exe be renamed but not
+        overwritten, so the running copy is moved aside first (it is deleted on the next start)."""
         try:
             os.replace(self.exe, self.exe + ".old")
             os.replace(self.exe + ".new", self.exe)
-            subprocess.Popen([self.exe])
+            if os.name != 'nt':
+                os.chmod(self.exe, 0o755)
+            env = dict(os.environ, PYINSTALLER_RESET_ENVIRONMENT="1")   # start fresh, not inside our unpacked files
+            for k in ("_MEIPASS2", "_PYI_APPLICATION_HOME_DIR", "_PYI_ARCHIVE_FILE", "_PYI_PARENT_PROCESS_LEVEL"):
+                env.pop(k, None)
+            subprocess.Popen([self.exe], env=env, close_fds=True)
             return True
         except OSError:
-            self.status, self.ready = f"{GAME_VERSION}  (could not install the update)", False
+            try:
+                if os.path.exists(self.exe + ".old") and not os.path.exists(self.exe):
+                    os.replace(self.exe + ".old", self.exe)             # put the old copy back
+            except OSError:
+                pass
+            self.state, self.status = 'done', f"{GAME_VERSION}  (could not install the update)"
             return False
 
 
@@ -3474,7 +3733,9 @@ class GameManager:
         self.net, self.netmatch, self.local_device, self.keep_keys = OnlineClient(), None, None, False
         self.on = dict(state='address', text=self._load_address(), rooms=[], sel=0, code='', slot=0, opp='', seed=0,
                        chars=[0, 1], stage=0, ready=[False, False], note='')
-        self.updater = Updater()
+        self.updater = Updater([self.on['text'], DEFAULT_SERVER])
+        if self.updater.enabled and not demo:
+            self.scene = 'UPDATE'                     # opening the game always checks for an update first
         self.cam = pygame.Rect(0, 0, WORLD_W, WORLD_W * 9 // 16)
         self.camf = [600.0, 300.0, 1200.0]
 
@@ -3543,8 +3804,13 @@ class GameManager:
             delta_time = min(self.clock.tick(FPS) / 1000.0, 0.1)
             accumulator += delta_time
             self._watch_performance()
-            if self.updater.ready and self.scene == 'TITLE' and self.updater.apply():
-                break
+            if self.scene == 'UPDATE':
+                if self.updater.state == 'ready' and self.updater.apply():
+                    self._render_frame()
+                    pygame.display.flip()
+                    break                                          # the new version is starting; this one closes
+                if self.updater.state in ('done', 'off'):
+                    self.scene = 'TITLE'
             self._handle_input_events()                               # 1. input
             steps = 0
             while accumulator >= step * 0.99 and steps < 3:
@@ -3580,7 +3846,11 @@ class GameManager:
         K = pygame
         up, down = k in (K.K_w, K.K_UP), k in (K.K_s, K.K_DOWN)
         enter = k in (K.K_RETURN, K.K_KP_ENTER)
-        if self.scene == 'TITLE':
+        if self.scene == 'UPDATE':
+            if k == K.K_ESCAPE:                                       # skip the update this time
+                self.updater.state = 'skipped'
+                self.scene = 'TITLE'
+        elif self.scene == 'TITLE':
             if up or down:
                 self.title_sel = (self.title_sel + (1 if down else -1)) % len(self.TITLE_OPTIONS)
             elif enter or k == K.K_SPACE:
@@ -3867,10 +4137,13 @@ class GameManager:
 
     def _render_frame(self):
         scene = self.scene
-        if scene in ('TITLE', 'ONLINE', 'PROFILES', 'MENU'):
+        if scene in ('TITLE', 'ONLINE', 'PROFILES', 'MENU', 'UPDATE'):
             self._menu_backdrop()
             if scene == 'TITLE':
                 self._render_title()
+                return
+            if scene == 'UPDATE':
+                self._render_update()
                 return
             {'ONLINE': self._render_online,
              'PROFILES': self._render_profiles, 'MENU': self._render_menu}[scene]()
@@ -4045,6 +4318,25 @@ class GameManager:
             else:
                 pygame.draw.rect(scr, lerp_color((60, 40, 100), col, k), (x, y, r * 2, r * 2))
 
+    def _render_update(self):
+        scr, u = self.screen, self.updater
+        self._title_backdrop()
+        scr.blit(self.logo, self.logo.get_rect(center=(SCREEN_WIDTH // 2, 170)))
+        self.text(scr, "AETHER CLASH", 96, (255, 214, 110), (SCREEN_WIDTH // 2, 300))
+        box = pygame.Rect(0, 0, 640, 120)
+        box.center = (SCREEN_WIDTH // 2, 430)
+        self.panel(box, (255, 220, 120), 210)
+        self.text(scr, u.status, 30, WHITE, (box.centerx, box.y + 36))
+        bar = pygame.Rect(box.x + 40, box.y + 72, box.w - 80, 18)
+        pygame.draw.rect(scr, (30, 24, 60), bar, border_radius=9)
+        if u.state == 'checking':                                    # unknown length: a sliding glow
+            x = bar.x + (self.frame * 6) % (bar.w + 120) - 120
+            pygame.draw.rect(scr, (140, 200, 255), pygame.Rect(x, bar.y, 120, bar.h).clip(bar), border_radius=9)
+        else:
+            pygame.draw.rect(scr, (120, 255, 170), (bar.x, bar.y, int(bar.w * u.progress), bar.h), border_radius=9)
+        pygame.draw.rect(scr, WHITE, bar, 2, border_radius=9)
+        self.text(scr, f"version {GAME_VERSION}        ESC  skip", 20, (190, 190, 230), (SCREEN_WIDTH // 2, 700), shadow=False)
+
     def _render_title(self):
         scr, t = self.screen, self.frame
         self._title_backdrop()
@@ -4082,10 +4374,10 @@ class GameManager:
         for p in self._settings_paths():
             try:
                 with open(p, encoding='utf-8') as fh:
-                    return str(json.load(fh).get('server', ''))[:60]
+                    return str(json.load(fh).get('server', ''))[:60] or DEFAULT_SERVER
             except (OSError, ValueError, AttributeError):
                 continue
-        return ""
+        return DEFAULT_SERVER
 
     def _save_address(self, text):
         for p in self._settings_paths():
@@ -4102,12 +4394,11 @@ class GameManager:
 
     def _online_connect(self):
         o = self.on
-        host, _, port = o['text'].strip().rpartition(':')
-        if not host:
-            host, port = o['text'].strip(), str(DEFAULT_PORT)
-        if not host or not port.isdigit():
+        hp = split_address(o['text'])
+        if not hp:
             o['note'] = "Type the server address, for example  myserver.example.com:7777"
             return
+        host, port = hp
         self._save_address(o['text'].strip())
         self.net.close()
         self.net = OnlineClient()

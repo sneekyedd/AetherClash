@@ -16,6 +16,11 @@ Messages are one JSON object per line.
   client -> server   {"type": "join", "code": "KQZM"} -> both get {"type": "paired", "slot": 0|1, "opponent": "...", "seed": n}
   client -> server   {"type": "leave"}                (leave the lobby; the other player gets {"type": "opponent_left"})
   anything else sent while paired is passed straight to the other player (fighter picks, inputs, ...)
+
+Game updates: the same port also answers two plain web requests, so players' games can update themselves
+even while the GitHub repository is private. server/run_server.py keeps the files in AETHER_UPDATE_DIR current.
+  GET /aether/latest.json      {"tag": "v0.1.12", "url": "/aether/AetherClash.exe", "sha256": "..."}
+  GET /aether/AetherClash.exe  the game itself
 """
 import asyncio
 import json
@@ -26,6 +31,9 @@ import sys
 
 PROTOCOL_VERSION = 2
 MAX_LINE = 4096
+UPDATE_DIR = os.environ.get("AETHER_UPDATE_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "updates")
+UPDATE_FILES = {"/aether/latest.json": ("latest.json", "application/json"),
+                "/aether/AetherClash.exe": ("AetherClash.exe", "application/octet-stream")}
 clients = {}            # writer -> {"name": str, "room": code or None}
 rooms = {}              # code -> {"host": writer, "guest": writer or None}
 
@@ -83,12 +91,47 @@ def new_code():
             return code
 
 
+async def serve_http(first_line, reader, writer):
+    """Answers a game's update check or download. Only the two fixed files can ever be served."""
+    try:
+        for _ in range(50):                                          # skip the request headers
+            line = await asyncio.wait_for(reader.readline(), 10)
+            if line in (b"\r\n", b"\n", b""):
+                break
+        parts = first_line.decode("latin-1").split()
+        path = parts[1].split("?")[0] if len(parts) > 1 else ""
+        name, kind = UPDATE_FILES.get(path, (None, None))
+        full = os.path.join(UPDATE_DIR, name) if name else None
+        if not full or not os.path.isfile(full):
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            await writer.drain()
+            return
+        size = os.path.getsize(full)
+        writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {size}\r\n"
+                     f"Cache-Control: no-store\r\nConnection: close\r\n\r\n".encode())
+        if parts[0] == "GET":
+            with open(full, "rb") as fh:
+                while True:
+                    chunk = fh.read(1 << 16)
+                    if not chunk:
+                        break
+                    writer.write(chunk)
+                    await writer.drain()
+        await writer.drain()
+    except (ConnectionError, asyncio.TimeoutError, OSError):
+        pass
+
+
 async def handle(reader, writer):
     sock = writer.get_extra_info("socket")
     if sock:
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)     # send every input at once, no batching
     try:
-        hello = json.loads(await reader.readline() or b"{}")
+        first = await reader.readline()
+        if first.startswith((b"GET ", b"HEAD ")):                    # a game checking for (or fetching) an update
+            await serve_http(first, reader, writer)
+            return
+        hello = json.loads(first or b"{}")
         if hello.get("type") != "hello" or hello.get("version") != PROTOCOL_VERSION:
             send(writer, type="error", reason="This game version does not match the server. Update the game.")
             return
@@ -139,8 +182,8 @@ async def handle(reader, writer):
         pass
     finally:
         leave_room(writer)
-        clients.pop(writer, None)
-        note_players()
+        if clients.pop(writer, None) is not None:
+            note_players()
         writer.close()
 
 

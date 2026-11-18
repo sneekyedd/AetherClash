@@ -10,7 +10,13 @@ services:
     ports:
       - "7777:7777"          # the one port to forward on your router (TCP)
     environment:
+      RELEASE_MINUTES: "5"   # how often it looks for a new game release to hand out to players
       UPDATE_MINUTES: "15"   # how often it looks for a newer server on GitHub
-      # GITHUB_TOKEN: ""     # only needed while the GitHub repository is private (read-only token)
+      GITHUB_TOKEN: ""       # read-only token, needed while the GitHub repository is private (see README)
+    volumes:
+      - aether-updates:/app/updates     # the copy of the latest game release players update from
     mem_limit: 128m
     cpus: 0.5
+
+volumes:
+  aether-updates:

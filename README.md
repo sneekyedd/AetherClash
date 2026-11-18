@@ -58,6 +58,7 @@ frames ahead ("lockstep"). The server does no game logic, so it needs almost no 
 ## Hosting the lobby server
 
 The server is one small Python file, `aether_server.py`. It needs **one TCP port (7777)** open to the internet.
+The same port also hands players the latest version of the game (see Automatic updates).
 
 **With Docker** (from a copy of this repository on the server):
 
@@ -74,15 +75,31 @@ python server/run_server.py
 Then on your router, forward **TCP port 7777** to the server's local IP address. Players connect to your public IP
 address or domain name followed by `:7777`.
 
-`server/run_server.py` keeps the server up to date: every 15 minutes it checks GitHub for a newer
-`aether_server.py` and restarts onto it once nobody is connected. While the repository is private it needs a
-read-only GitHub token in the `GITHUB_TOKEN` setting.
+`server/run_server.py` restarts the server if it ever stops, switches to a newer `aether_server.py` from GitHub
+(checked every 15 minutes, applied only when nobody is connected), and keeps a copy of the newest game release
+(checked every 5 minutes).
 
 ## Automatic updates
 
-The packaged game checks GitHub for a newer release each time it starts. If there is one it downloads the new
-`AetherClash.exe`, swaps it in and restarts. This only works while the repository's releases are publicly
-downloadable.
+Every time the packaged game opens, it checks for a newer release before the title screen. If there is one, it
+downloads it, checks it is intact, swaps it in and restarts into it. Press Esc on that screen to skip.
+
+It looks in two places:
+
+1. **Your lobby server**, which keeps a copy of the newest release. This works while the GitHub repository is
+   private, because only the server needs access to GitHub.
+2. **GitHub itself**, which only works if the repository is public.
+
+To make the lobby-server route work:
+
+1. **Give the server read access to the repository.** Create a fine-grained personal access token on GitHub
+   (Settings, Developer settings, Personal access tokens) for this repository only, with read-only
+   **Contents** access. Put it in `GITHUB_TOKEN` in `server/docker-compose.yml` (or set it as an environment
+   variable when running `server/run_server.py`), then restart the server.
+2. **Tell the game where the server is.** In the GitHub repository, go to Settings, Secrets and variables,
+   Actions, Variables, and add a variable named `AETHER_SERVER` with your address, for example
+   `myserver.example.com:7777`. Every build from then on knows the server: it is used for updates and filled in
+   on the Online screen. Copies built before that learn the address the first time they connect online.
 
 ## Fighters
 
@@ -101,14 +118,16 @@ downloadable.
 
 ## Artwork
 
-The fighters are drawn from the sprite images in `assets/<fighter>/`: one image per move (`jab.png`, `fsmash.png`,
-...) plus movement poses (`idle`, `run_1`, `run_2`, ..., `jump`, `fall`, `hurt`, `shield`, ...). These are packed
-into the `.exe`. Any fighter or pose without an image falls back to the nearest pose, or to the code-drawn fighter.
+The fighters are drawn by code. Their attacks are circles: every hitbox is a circle (long attacks are a chain of
+circles), and what you see on screen is exactly that circle, in the fighter's own style. Press F1 in a match to
+outline the real hitboxes in red.
 
-To change the art, put an `assets` folder next to the game; it takes priority over the built-in images.
+The sprite images cut from the supplied artwork sheets are kept in `art/custom_sprites/` but are not used for now.
+To switch a fighter back to them, move its folder (for example `art/custom_sprites/kai`) into `assets/`.
+
+Any fighter folder in `assets/` replaces that fighter's code-drawn art:
 
 - A still pose is `assets/kai/idle.png`; an animation is `run_1.png`, `run_2.png`, ... played in number order.
 - Draw the fighter facing right on a transparent background.
-- `assets/kai/sprite.json` holds the size and alignment: `scale`, `fps`, `anchors` (where the body centre and feet
-  are in each image, so effects painted into a move do not shift the fighter) and `zoom` (per-image size tweak).
+- `assets/kai/sprite.json` holds the size and alignment: `scale`, `fps`, `anchors` and `zoom`.
 - Stage backgrounds: `assets/bg_atoll.png`, `bg_loom.png`, `bg_crucible.png` (2400x1400).
