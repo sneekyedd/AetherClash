@@ -43,10 +43,16 @@ BLAST_ZONE = pygame.Rect(280, 120, 1840, 1210)   # leave this box and you lose a
 
 MAX_LIVES = 3
 KNOCKBACK_DIVISOR = 200.0   # Final Force = Base Force * (1.0 + Cumulative Damage / 200.0)
-KB_DECAY = 0.5              # launch speed lost per frame (constant, so distance grows with force squared)
-HITSTUN_PER_SPEED = 1.5     # frames of hitstun per unit of launch speed
-HITSTUN_GRAVITY = 0.3       # gravity is weaker while being launched, so upward KOs are possible
-TUMBLE_SPEED = 11.0         # launches faster than this "knock down" the target (spinning tumble)
+# How a launch behaves, as in Smash Ultimate: launch speed = knockback x 0.03 units/frame, losing 0.051 every
+# frame; hitstun = knockback x 0.4 - 1 frames; falling still pulls on you; tumbling from 80 knockback.
+# (How hard a hit is - Final Force = Base Force x (1 + damage / 200) - is unchanged; LAUNCH_SCALE converts that
+# force into launch speed so KOs happen at the same percentages as before.)
+LAUNCH_SCALE = 0.72
+KB_DECAY = 0.051 * 4.8                  # launch speed lost per frame (pixels/frame)
+HITSTUN_PER_SPEED = 0.4 / (0.03 * 4.8)  # frames of hitstun per pixel/frame of launch speed
+HITSTUN_GRAVITY = 1.0                   # falling speed still applies while launched
+TUMBLE_SPEED = 80 * 0.03 * 4.8          # knockback of 80 or more sends you tumbling
+VERTICAL_LAUNCH_FALL = 1.8 * 4.8        # Ultimate: near-vertical launches share one falling speed
 
 # --- Aether economy -------------------------------------------------
 AETHER_MAX = 100.0
@@ -77,6 +83,21 @@ DUEL_TARGET = 25            # correct key presses needed to win the Death Ray du
 
 WHITE = (255, 255, 255)
 PLAYER_TAGS = [(255, 96, 96), (96, 170, 255)]
+
+
+# Movement copies Super Smash Bros. Ultimate. Each fighter's movement values are a real Smash fighter's, in
+# Smash's own distance units (see ROSTER, taken from SmashWiki's attribute tables), converted with this
+# scale: about 4.8 pixels per unit, which makes a mid-sized fighter about 16 units tall, as in Smash.
+SMASH_UNIT = 4.8
+FAST_FALL_MULT = 1.6        # fast-falling is exactly 1.6x the falling speed for every fighter in Ultimate
+FULL_HOP_BOOST = (4, 0.55)  # Ultimate: a full hop covers 55% of its height in its first 4 frames
+LIGHT_LANDING = 2           # frames of lag after an ordinary landing (heavy landings are per fighter)
+TURN_DASH_DELAY = 3         # Ultimate: a turnaround dash waits 3 frames before it accelerates
+
+
+def approach(v, target, step):
+    """Moves v toward target by at most step (how traction and air friction slow things down)."""
+    return min(v + step, target) if v < target else max(v - step, target)
 
 
 def clamp(v, lo, hi):
@@ -150,12 +171,30 @@ class CharacterData:
         self.id = slot
         self.player_name, self.is_cpu = name, False
         self.max_lives = MAX_LIVES
-        self.speed = base_stats['speed']
-        self.air_speed = base_stats['air_speed']
-        self.jump_height = base_stats['jump_height']        # initial jump velocity (px / frame)
-        self.double_jump = base_stats['double_jump']
-        self.gravity = base_stats['gravity']
-        self.max_fall = base_stats['max_fall']
+        sm, u = base_stats['smash'], SMASH_UNIT              # Smash-style movement values, converted to pixels
+        self.walk_speed = sm['walk'] * u
+        self.init_dash = sm['initial_dash'] * u              # the burst of speed when you start to dash
+        self.dash_frames = sm['dash_frames']                 # how long that burst lasts before it becomes a run
+        self.speed = sm['run'] * u                           # top running speed
+        self.run_accel = sm['run_accel'] * u
+        self.traction = sm['traction'] * u                   # how fast you slow down on the ground
+        self.air_speed = sm['air_speed'] * u                 # top sideways speed in the air
+        self.air_accel = sm['air_accel'] * u
+        self.air_friction = sm['air_friction'] * u           # slowdown in the air when not steering
+        self.gravity = sm['gravity'] * u
+        self.max_fall = sm['fall'] * u
+        self.jump_squat = sm.get('jump_squat', 3)            # frames crouched before leaving the ground
+        self.heavy_landing = sm.get('heavy_landing', 4)
+        g = self.gravity                                     # jump heights -> take-off speeds, Smash's way:
+        launch = lambda height: math.sqrt(2 * g * height) + g / 2        # sqrt(2 g h) + g / 2
+        self.full_hop_h = sm['full_hop'] * u
+        self.hop_boost_h = self.full_hop_h * FULL_HOP_BOOST[1]
+        self.jump_height = launch(self.full_hop_h)          # (used for ledge jumps)
+        rest = self.full_hop_h - self.hop_boost_h            # the speed that rises exactly `rest` more, frame by frame
+        self.after_boost = -g / 2 + math.sqrt(g * g / 4 + 2 * g * rest)
+        self.short_hop = launch(sm['short_hop'] * u)
+        self.double_jump = launch(sm['double_jump'] * u)
+        self.vscale = math.sqrt(self.gravity / base_stats['gravity'])   # keeps move lunges/recoveries the same height
         self.weight = base_stats['weight']
         self.air_jumps = base_stats.get('air_jumps', 1)
         self.w, self.h = base_stats['w'], base_stats['h']
@@ -192,6 +231,8 @@ class CharacterData:
         self.buff_timer = 0
         self.respawn_timer = 0
         self.run_frames = 0
+        self.dash_t, self.dash_dir, self.squat, self.jump_held = 0, facing, 0, False
+        self.turn_t, self.hop_t, self.kb_vertical = 0, 0, False
         self.flash = 0
         self.anim = random.random() * 100
         self.grab_target = self.grabbed_by = None
@@ -327,8 +368,8 @@ KAI_MOVE_SET = dict(
     ftilt=A("Thread Slash", 22, hb(5, 8, 48, -4, 64, 30, 7, 9, 35)),
     utilt=A("Crescent Stitch", 22, hb(4, 9, 10, -52, 70, 50, 6, 9, 85)),
     dtilt=A("Low Hem", 18, hb(4, 6, 44, 30, 60, 18, 5, 8, 75)),
-    dash=A("Slipknot", 26, hb(5, 11, 34, 4, 58, 34, 6, 11.5, 38), impulses={0: (11, None)}),
-    dashheavy=A("Seamrender", 50, hb(22, 26, 52, -4, 80, 46, 17, 19.5, 40), impulses={0: (8, None), 20: (16, None)}),
+    dash=A("Slipknot", 26, hb(5, 11, 34, 4, 58, 34, 6, 11.5, 38)),
+    dashheavy=A("Seamrender", 50, hb(22, 26, 52, -4, 80, 46, 17, 19.5, 40), impulses={20: (16, None)}),
     fsmash=A("Burst Strike", 40, hb(12, 15, 58, -6, 76, 40, 15, 16.5, 38)),
     usmash=A("Spindle Rise", 40, hb(9, 14, 6, -64, 60, 70, 13, 16, 88)),
     dsmash=A("Seam Splitter", 42, hb(8, 9, 74, 28, 26, 24, 13, 13, 25, spike=True), hb(8, 9, -74, 28, 26, 24, 13, 13, 155, spike=True),
@@ -353,8 +394,8 @@ BRONN_MOVE_SET = dict(
     ftilt=A("Shield Bash", 30, hb(9, 13, 54, -6, 64, 48, 11, 12, 35)),
     utilt=A("Lintel Lift", 30, hb(8, 13, 8, -66, 84, 48, 10, 12, 88)),
     dtilt=A("Foundation Kick", 26, hb(7, 10, 52, 36, 70, 22, 9, 10, 30)),
-    dash=A("Rampart Rush", 36, hb(8, 16, 40, 0, 60, 70, 10, 12.5, 40), impulses={0: (10, None)}, armor=(4, 14)),
-    dashheavy=A("Avalanche Charge", 62, hb(26, 32, 58, -6, 92, 84, 22, 20.5, 42), impulses={0: (8, None), 24: (14, None)},
+    dash=A("Rampart Rush", 36, hb(8, 16, 40, 0, 60, 70, 10, 12.5, 40), armor=(4, 14)),
+    dashheavy=A("Avalanche Charge", 62, hb(26, 32, 58, -6, 92, 84, 22, 20.5, 42), impulses={24: (14, None)},
                 armor=(10, 32)),
     fsmash=A("Keystone Hammer", 54, hb(20, 24, 70, -10, 90, 70, 22, 19, 40), armor=(14, 24)),
     usmash=A("Tower Crown", 50, hb(15, 21, 0, -70, 100, 100, 19, 18, 90)),
@@ -382,8 +423,8 @@ NYX_MOVE_SET = dict(
     ftilt=A("Orbit Swipe", 26, hb(7, 11, 56, -6, 74, 30, 8, 10, 35)),
     utilt=A("Halo", 26, hb(6, 12, 0, -60, 90, 36, 7, 9.5, 90)),
     dtilt=A("Umbral Sweep", 22, hb(5, 8, 50, 32, 72, 18, 6, 8, 80)),
-    dash=A("Comet Slide", 30, hb(6, 13, 36, 8, 62, 36, 7, 11, 38), impulses={0: (10, None)}),
-    dashheavy=A("Supernova Rush", 54, hb(22, 27, 50, -6, 96, 90, 17, 19.5, 42), impulses={0: (9, None), 20: (15, None)}),
+    dash=A("Comet Slide", 30, hb(6, 13, 36, 8, 62, 36, 7, 11, 38)),
+    dashheavy=A("Supernova Rush", 54, hb(22, 27, 50, -6, 96, 90, 17, 19.5, 42), impulses={20: (15, None)}),
     fsmash=A("Nova Lance", 46, hb(15, 18, 80, -8, 120, 30, 16, 17, 35)),
     usmash=A("Zenith Flare", 46, hb(12, 18, 0, -76, 70, 110, 15, 16.5, 90)),
     dsmash=A("Eclipse Ring", 48, hb(10, 11, 92, 26, 30, 38, 14, 13, 30, spike=True), hb(10, 11, -92, 26, 30, 38, 14, 13, 150, spike=True),
@@ -410,8 +451,8 @@ RHEA_MOVE_SET = dict(
     ftilt=A("Ember Hook", 24, hb(6, 9, 44, -8, 52, 36, 9, 10.5, 40)),
     utilt=A("Flare Upper", 24, hb(5, 10, 14, -50, 50, 64, 8, 10, 85)),
     dtilt=A("Coal Sweep", 20, hb(5, 8, 44, 32, 60, 20, 7, 8.5, 70)),
-    dash=A("Wildfire Knee", 28, hb(5, 12, 34, -2, 50, 50, 8, 12, 40), impulses={0: (12, None)}),
-    dashheavy=A("Meteor Rush", 52, hb(20, 24, 50, -6, 72, 60, 20, 19.5, 40), impulses={0: (9, None), 18: (17, None)}),
+    dash=A("Wildfire Knee", 28, hb(5, 12, 34, -2, 50, 50, 8, 12, 40)),
+    dashheavy=A("Meteor Rush", 52, hb(20, 24, 50, -6, 72, 60, 20, 19.5, 40), impulses={18: (17, None)}),
     fsmash=A("Kiln Breaker", 46, hb(14, 18, 56, -8, 70, 50, 19, 18, 38), impulses={12: (8, None)}),
     usmash=A("Eruption", 44, hb(10, 16, 8, -66, 56, 90, 16, 17, 90)),
     dsmash=A("Magma Stomp", 46, hb(12, 13, 84, 28, 30, 36, 16, 14, 35, spike=True), hb(12, 13, -84, 28, 30, 36, 16, 14, 145, spike=True),
@@ -434,7 +475,11 @@ ROSTER = [
     dict(name="Kai", title="The Weaver", faction="Weaver", style='weaver', moves=KAI_MOVE_SET,
          blurb=["Thread-blade duelist. Fastest on the", "ground, strings quick hits into combos,", "but light and easy to launch."],
          stats=dict(speed=8.2, air_speed=6.2, jump_height=15, double_jump=14, gravity=0.68, max_fall=12,
-                    weight=86, w=44, h=78),
+                    weight=86, w=44, h=78,
+                    # movement copied from Smash Ultimate's Sheik: the fastest runner, light, built for combos (SmashWiki attributes, Smash units)
+                    smash=dict(walk=1.47, initial_dash=2.178, dash_frames=7, run=2.42, run_accel=0.165, traction=0.106,
+                                    air_speed=1.155, air_accel=0.09, air_friction=0.015, gravity=0.15, fall=1.75,
+                                    full_hop=39, short_hop=18.75, double_jump=40, heavy_landing=4)),
          bars=(5, 2, 2, 3), ai=dict(mid=['nspecial', 'sspecial'], close=['dspecial']),
          colors=dict(main=(170, 44, 54), dark=(104, 30, 46), accent=(230, 182, 86), skin=(236, 192, 152),
                      hair=(122, 70, 44), band=(200, 52, 56), wrap=(208, 172, 122), boot=(118, 66, 46)),
@@ -443,7 +488,11 @@ ROSTER = [
     dict(name="Bronn", title="The Sentinel", faction="Sentinel", style='sentinel', moves=BRONN_MOVE_SET,
          blurb=["Stone-clad guardian. Slow and heavy with", "armored attacks, a counter stance and", "walls that punish reckless aggression."],
          stats=dict(speed=5.4, air_speed=4.4, jump_height=15.5, double_jump=13.5, gravity=0.78, max_fall=14,
-                    weight=124, w=64, h=94),
+                    weight=124, w=64, h=94,
+                    # movement copied from Smash Ultimate's Ganondorf: slow, heavy, short jumps (SmashWiki attributes, Smash units)
+                    smash=dict(walk=0.767, initial_dash=1.87, dash_frames=15, run=1.34, run_accel=0.13893, traction=0.125,
+                                    air_speed=0.83, air_accel=0.04, air_friction=0.015, gravity=0.108, fall=1.65,
+                                    full_hop=25.49, short_hop=12.24, double_jump=26, heavy_landing=5)),
          bars=(2, 5, 5, 3), ai=dict(mid=['sspecial', 'dspecial'], close=['nspecial']),
          colors=dict(main=(70, 124, 192), dark=(34, 58, 108), accent=(120, 240, 255), skin=(92, 150, 210),
                      stone=(136, 142, 154), steel=(158, 164, 178), belt=(122, 82, 54)),
@@ -452,7 +501,11 @@ ROSTER = [
     dict(name="Nyx", title="The Hollow Star", faction="Voidcaller", style='voidcaller', moves=NYX_MOVE_SET,
          blurb=["Floaty star-mage with three jumps.", "Controls space with orbs, lances and a", "gravity well; teleports to recover."],
          stats=dict(speed=6.2, air_speed=5.6, jump_height=13.5, double_jump=12.5, gravity=0.46, max_fall=8.5,
-                    weight=88, w=42, h=82, air_jumps=2),
+                    weight=88, w=42, h=82, air_jumps=2,
+                    # movement copied from Smash Ultimate's Mewtwo: floaty; Mewtwo's one huge double jump (57.35) split over Nyx's two (SmashWiki attributes, Smash units)
+                    smash=dict(walk=1.26, initial_dash=2.255, dash_frames=10, run=2.255, run_accel=0.11, traction=0.116,
+                                    air_speed=1.313, air_accel=0.07, air_friction=0.016, gravity=0.082, fall=1.55,
+                                    full_hop=31.11, short_hop=17.5, double_jump=28.7, heavy_landing=5)),
          bars=(3, 3, 2, 5), ai=dict(mid=['nspecial', 'sspecial', 'dspecial'], close=[]),
          colors=dict(main=(104, 70, 156), dark=(52, 34, 88), accent=(255, 122, 230), skin=(18, 10, 32),
                      hat=(118, 80, 168), hatband=(162, 116, 208)),
@@ -461,7 +514,11 @@ ROSTER = [
     dict(name="Rhea", title="The Cinderfist", faction="Kindled", style='kindled', moves=RHEA_MOVE_SET,
          blurb=["Close-range brawler. Short reach but", "every punch hurts. Spend Aether to", "Ignite and hit 30% harder."],
          stats=dict(speed=7.0, air_speed=5.4, jump_height=15, double_jump=13.5, gravity=0.72, max_fall=13,
-                    weight=104, w=52, h=84),
+                    weight=104, w=52, h=84,
+                    # movement copied from Smash Ultimate's Terry: a grounded brawler (SmashWiki attributes, Smash units)
+                    smash=dict(walk=0.85, initial_dash=1.65, dash_frames=10, run=1.72, run_accel=0.16, traction=0.111,
+                                    air_speed=0.95, air_accel=0.06, air_friction=0.012, gravity=0.09, fall=1.48,
+                                    full_hop=27, short_hop=15.2, double_jump=29, heavy_landing=4)),
          bars=(4, 4, 3, 1), ai=dict(mid=['sspecial', 'dspecial'], close=['nspecial']),
          colors=dict(main=(222, 98, 34), dark=(128, 62, 32), accent=(255, 216, 92), skin=(246, 200, 160),
                      flame=(246, 104, 26), band=(138, 90, 52), wrap=(216, 186, 142)),
@@ -602,7 +659,7 @@ class PhysicsEngine:
             if ix is not None:
                 c.vx = ix * c.facing
             if iy is not None:
-                c.vy = iy
+                c.vy = iy * c.vscale
                 if iy < 0:
                     c.ground = None
         if m.aim:
@@ -644,8 +701,16 @@ class PhysicsEngine:
         m = c.current_move
         if m and m.no_gravity and m.no_gravity[0] <= c.move_frame <= m.no_gravity[1]:
             return
+        if c.hop_t > 0:                                       # the sped-up start of a full hop
+            c.hop_t -= 1
+            c.vy = -c.hop_boost_h / FULL_HOP_BOOST[0]
+            if c.hop_t == 0:
+                c.vy = -c.after_boost                         # the rest of the jump rises as normal
+            return
         g = c.gravity * (HITSTUN_GRAVITY if c.hitstun > 0 else 1.0)
-        cap = c.max_fall * (1.6 if c.fast_fall else 1.0)
+        cap = c.max_fall * (FAST_FALL_MULT if c.fast_fall else 1.0)
+        if c.hitstun > 0 and c.kb_vertical:
+            cap = VERTICAL_LAUNCH_FALL
         c.vy = min(c.vy + g, max(cap, c.vy))
         if c.fast_fall and c.vy > 0:
             c.vy = max(c.vy, cap)
@@ -657,27 +722,75 @@ class PhysicsEngine:
         scripted = m and m.no_gravity and m.no_gravity[0] <= c.move_frame <= m.no_gravity[1]
         if c.ground:
             if st in ("IDLE", "RUNNING", "PARRY_SUCCESS") and c.lag == 0:
-                target = c.move_x * c.speed
-                accel = c.speed * 0.22
-                c.vx += clamp(target - c.vx, -accel, accel)
+                self._ground_move(c)
             elif st == "DODGE":
                 c.vx *= 0.93
-            elif not scripted:
-                c.vx *= 0.88
+            elif not scripted:                                # attacking, shielding, jump squat, landing: slide to a stop
+                plant = m and m.slot == 'dashheavy' and m.hitbox_data and c.move_frame < m.hitbox_data[0]['start'] - 2
+                c.vx = approach(c.vx, 0.0, c.traction * (3.0 if plant else 1.0))   # a dash attack keeps its run speed
+                # and slides; the heavy one digs in to wind up, then lunges
+                c.dash_t = c.turn_t = 0
         elif not scripted:
             if st in ("JUMPING", "HELPLESS", "ATTACKING") and c.move_x:
-                nv = c.vx + c.move_x * c.air_speed * 0.09
-                if abs(nv) <= c.air_speed or abs(nv) < abs(c.vx):
-                    c.vx = nv
-                elif abs(c.vx) > c.air_speed:
-                    c.vx *= 0.97
+                nv = c.vx + c.move_x * c.air_accel
+                if abs(nv) > c.air_speed:                     # at top speed (or coasting faster): no more speed
+                    nv = sign(nv) * (max(abs(c.vx) - c.air_friction, c.air_speed) if abs(c.vx) > c.air_speed else c.air_speed)
+                c.vx = nv
             else:
-                c.vx *= 0.95
+                c.vx = approach(c.vx, 0.0, c.air_friction)
         # knockback is its own velocity that decays at a constant rate
         sp = math.hypot(c.kbx, c.kby)
         if sp > 0:
             ns = max(0.0, sp - KB_DECAY * (2.0 if c.ground else 1.0))
             c.kbx, c.kby = c.kbx * ns / sp, c.kby * ns / sp
+
+    def _ground_move(self, c):
+        """Smash-style running. Pressing a direction from standing starts an initial dash (a short burst at a fixed
+        speed, which can be reversed instantly - a dash dance). After it you run, accelerating to top speed.
+        Let go and you skid to a stop by your traction; reverse out of a run and you skid before turning."""
+        d = c.move_x
+        if d == 0:
+            c.dash_t = c.turn_t = 0
+            c.vx = approach(c.vx, 0.0, c.traction)
+            return
+        if c.turn_t > 0:                                      # turnaround dash: a short wait before accelerating
+            c.turn_t -= 1
+            c.vx = approach(c.vx, 0.0, c.init_dash / TURN_DASH_DELAY)
+            if c.turn_t == 0:
+                c.dash_dir, c.dash_t, c.vx = d, c.dash_frames, d * c.init_dash
+            return
+        if c.dash_t > 0:                                      # in the initial dash
+            if d != c.dash_dir:                               # reversed: a dash dance
+                c.turn_t, c.dash_t = TURN_DASH_DELAY, 0
+                return
+            c.dash_t -= 1
+            c.vx = d * c.init_dash
+            return
+        if c.vx * d < 0 and abs(c.vx) > c.walk_speed * 0.5:  # turning around out of a run
+            c.vx = approach(c.vx, 0.0, c.traction * 2)
+            return
+        if abs(c.vx) < c.walk_speed * 0.5:                    # from (nearly) standing: dash
+            c.dash_dir, c.dash_t = d, c.dash_frames
+            c.vx = d * c.init_dash
+            return
+        if abs(c.vx) < c.speed:                               # running: build up to top speed...
+            c.vx = approach(c.vx, d * c.speed, c.run_accel)
+        else:                                                 # ...or settle down to it after the faster dash
+            c.vx = approach(c.vx, d * c.speed, c.traction)
+
+    def launch_jump(self, c):
+        """End of the jump squat. Still holding jump = full hop, already let go = short hop (about half as high).
+        Running speed carries into the jump."""
+        if c.jump_held:                                       # full hop, with Ultimate's sped-up start
+            c.hop_t = FULL_HOP_BOOST[0] + 1                   # (+1: the take-off happens at the end of a frame)
+            c.vy = -c.hop_boost_h / FULL_HOP_BOOST[0]
+        else:
+            c.vy = -c.short_hop
+        top = c.air_speed * 1.15
+        c.vx = clamp(c.vx * 0.85 + c.move_x * c.air_speed * 0.25, -top, top)
+        c.ground, c.fast_fall, c.dash_t = None, False, 0
+        c.squash = 0.2                                        # stretch upward as they leave the ground
+        c.current_state = "JUMPING"
 
     # ------------------------------------------------------------ platforms
     @staticmethod
@@ -741,6 +854,7 @@ class PhysicsEngine:
 
     def _land(self, c, p):
         c.squash = -min(0.24, 0.06 + abs(c.vy) * 0.014)       # squash on landing, harder after a long fall
+        hard = c.fast_fall or c.vy >= c.max_fall * 0.95
         c.y, c.vy, c.ground = p.y, 0.0, p
         c.kby = 0.0
         c.jumps_left = c.air_jumps
@@ -757,10 +871,12 @@ class PhysicsEngine:
             c.lag = 8
         elif c.current_state == "DODGE":
             c.dodge_timer = min(c.dodge_timer, 8)
+        elif c.current_state == "JUMPING" and c.hitstun == 0:
+            c.lag = c.heavy_landing if hard else LIGHT_LANDING   # light or heavy landing, as in Smash
 
     def _sync_ground_state(self, c):
         st = c.current_state
-        if c.ground is None and st in ("IDLE", "RUNNING", "SHIELD"):
+        if c.ground is None and st in ("IDLE", "RUNNING", "SHIELD", "JUMPSQUAT"):
             c.current_state = "JUMPING"
         elif c.ground is not None and st == "JUMPING":
             c.current_state = "IDLE"
@@ -883,8 +999,9 @@ class PhysicsEngine:
         """CORE MECHANIC: the more damage you have taken, the further you fly."""
         knockback_modifier = 1.0 + (target.cumulative_damage_taken / KNOCKBACK_DIVISOR)
         final_force = base_force * knockback_modifier
-        speed = final_force * 200.0 / (100.0 + target.weight)     # heavier fighters resist the same force
+        speed = final_force * 200.0 / (100.0 + target.weight) * LAUNCH_SCALE   # heavier fighters resist the same force
         dx, dy = direction
+        target.kb_vertical = 70 <= math.degrees(math.atan2(-dy, dx if dx else 1e-9)) % 360 <= 110
         if target.ground and dy > 0.2:                   # spiked into the floor: bounce back up
             dy = -dy * 0.8
         target.vx = target.vy = 0.0
@@ -1008,7 +1125,7 @@ class CombatManager:
         # --- 3. dynamic knockback + hit / stun state ------------------------------
         speed = self.physics.apply_knockback(attacker, target, force, direction)
         self._enter_hit_state(target, speed)
-        if speed > 22:
+        if speed > 16:
             self.fx.ring(tx, ty, attacker.colors['accent'], 20, 10, 16)
         if spiked:
             self.fx.text(tx, ty - target.h, "SPIKE!", (255, 120, 255), 50)
@@ -1109,7 +1226,8 @@ class CombatManager:
         target.current_move = None
         target.current_state = "HIT"
         target.is_knocked_down = speed >= TUMBLE_SPEED
-        target.hitstun = int(speed * HITSTUN_PER_SPEED) + 4
+        target.hitstun = max(4, int(speed * HITSTUN_PER_SPEED) - 1)      # 0.4 x knockback - 1, at least 4
+        target.hop_t = 0
         target.stun_timer = target.dodge_timer = target.lag = 0
         target.fast_fall = target.jump_cut = False
         target.ledge = None
@@ -1228,6 +1346,10 @@ class CombatManager:
                 c.state_timer -= 1
                 if c.state_timer <= 0:
                     c.current_state = "JUMPING" if c.ground is None else "IDLE"
+            elif st == "JUMPSQUAT":
+                c.squat -= 1
+                if c.squat <= 0:
+                    self.physics.launch_jump(c)
             elif st == "DODGE":
                 c.dodge_timer -= 1
                 if c.dodge_timer <= 0:
@@ -1341,6 +1463,7 @@ class CharacterController:
         c = self.char
         c.in_x, c.in_y = inp.x, inp.y
         c.shield_held = 'shield' in inp.held
+        c.jump_held = 'jump' in inp.held
         for b in self.buffer:
             self.buffer[b] -= 1
         for b in inp.pressed:
@@ -1371,7 +1494,7 @@ class CharacterController:
         if c.jump_cut and 'jump' not in inp.held:        # released jump early = short hop
             c.vy *= 0.45
             c.jump_cut = False
-        if st in ("ATTACKING", "HELPLESS"):
+        if st in ("ATTACKING", "HELPLESS", "JUMPSQUAT"):    # (buttons pressed now are buffered for take-off)
             return
         if st == "LEDGE":
             self._ledge_options(inp)
@@ -1403,8 +1526,9 @@ class CharacterController:
             return
         heavy = self._take('heavy')
         if heavy or self._take('attack'):
+            # out of a dash or run, straight away - pressing a direction and the button together still gives a tilt
             running = (grounded and c.current_state == "RUNNING" and inp.x == c.facing and inp.y == 0
-                       and abs(c.vx) >= c.speed * 0.6 and c.run_frames >= 6)
+                       and c.run_frames >= 3 and (c.dash_t > 0 or abs(c.vx) >= c.walk_speed * 0.8))
             if grounded:
                 if c.shield_held and not heavy:
                     slot = 'grab'
@@ -1438,10 +1562,14 @@ class CharacterController:
 
     def _jump(self):
         c = self.char
-        if c.ground is not None or c.current_state == "LEDGE":
-            c.vy, c.jump_cut = -c.jump_height, True
+        if c.ground is not None:                         # crouch for the jump squat first (see launch_jump)
+            c.current_state, c.squat = "JUMPSQUAT", c.jump_squat
+            return
+        if c.current_state == "LEDGE":
+            c.vy = -c.jump_height
         elif c.jumps_left > 0:
             c.jumps_left -= 1
+            c.hop_t = 0
             c.vy = -c.double_jump
             c.vx = c.in_x * c.air_speed * 0.8 if c.in_x else c.vx
             self.combat.fx.ring(c.x, c.y, c.colors['accent'], 10, 4, 10)
@@ -1456,6 +1584,7 @@ class CharacterController:
         c.current_state = "DODGE"
         c.intangible = max(c.intangible, 16)
         if air:
+            c.hop_t = 0
             c.air_dodged, c.dodge_timer = True, 26
             n = math.hypot(x, y)
             if n:
@@ -2704,6 +2833,9 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
     return pygame.transform.smoothscale(s, (SPR, SPR))
 
 
+MENU_CLOTH = {}             # menu poses get real cloth physics too, so robes, scarves and hair hang naturally
+
+
 def quick_sprite(spec, col, key, facing, t, zoom=1.5, assets=None):
     """A fighter in a named pose with no blending, enlarged with crisp pixels (menus, result screen)."""
     art = assets.frame(spec['name'].lower(), key, t, None, spec['stats']['h'] * 1.5, facing, zoom) if assets else None
@@ -2712,7 +2844,13 @@ def quick_sprite(spec, col, key, facing, t, zoom=1.5, assets=None):
         bob = math.sin(t * 0.07) * 1.5 * zoom if key == 'idle' else 0
         surf.blit(art[0], (SPR_CX * zoom - art[1], SPR_FEET * zoom - art[2] - bob))
         return surf
-    spr = render_fighter_surface(spec, col, target_pose(spec, key, t), facing, t, key)
+    ck = (spec['name'], key, facing)
+    cloth = MENU_CLOTH.get(ck)
+    if cloth is None:
+        cloth = MENU_CLOTH[ck] = ClothSim()
+        for i in range(90):                                  # let the cloth settle before it is first shown
+            render_fighter_surface(spec, col, target_pose(spec, key, t - 90 + i), facing, t - 90 + i, key, cloth=cloth)
+    spr = render_fighter_surface(spec, col, target_pose(spec, key, t), facing, t, key, cloth=cloth)
     small = pygame.transform.smoothscale(spr, (int(SPR * zoom / PIXEL), int(SPR * zoom / PIXEL)))
     return pygame.transform.scale(small, (int(SPR * zoom), int(SPR * zoom)))
 
@@ -3225,7 +3363,7 @@ class StateTranslator:
         vs = c.__dict__.get('vis') or {}
         if state == "RUNNING":
             v['sprite_key'] = 'run'
-        elif state == "IDLE" and vs.get('land'):
+        elif (state == "IDLE" and vs.get('land')) or state == "JUMPSQUAT":
             v['sprite_key'] = 'land'
         elif state == "JUMPING" and vs.get('flip'):
             v.update(sprite_key='tuck', rotation=-360.0 * (1 - vs['flip'] / 26) * c.facing)
@@ -3738,7 +3876,8 @@ class Updater:
 
 class GameManager:
     P2_MODES = ["CPU - Easy", "CPU - Normal", "CPU - Hard", "Human"]
-    TITLE_OPTIONS = ["Local Play", "Online", "Profiles & Controls", "Quit"]
+    TITLE_OPTIONS = ["Local Play", "Online", "Profiles & Controls", "Full Screen", "Quit"]
+    SETTINGS_FILE = "aether_clash_settings.json"
     ONLINE_FILE = "aether_clash_online.json"
 
     def __init__(self, headless=False, demo=False, profile_path=None):
@@ -3751,7 +3890,9 @@ class GameManager:
             pygame.display.set_icon(make_icon(64))
         except pygame.error:
             pass
-        self.screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        self.settings = self._load_settings()
+        self.fullscreen = bool(self.settings.get('fullscreen')) and not headless
+        self._set_display()
         self.clock = pygame.time.Clock()
         self.world = pygame.Surface((WORLD_W, WORLD_H)).convert()
         self.fonts = {}
@@ -3793,6 +3934,59 @@ class GameManager:
             self.scene = 'UPDATE'                     # opening the game always checks for an update first
         self.cam = pygame.Rect(0, 0, WORLD_W, WORLD_W * 9 // 16)
         self.camf = [600.0, 300.0, 1200.0]
+
+    # ------------------------------------------------------------ display / settings
+    def _settings_file_paths(self):
+        return [os.path.join(app_dir(), self.SETTINGS_FILE), os.path.join(os.path.expanduser("~"), "." + self.SETTINGS_FILE)]
+
+    def _load_settings(self):
+        for p in self._settings_file_paths():
+            try:
+                with open(p, encoding='utf-8') as fh:
+                    data = json.load(fh)
+                if isinstance(data, dict):
+                    return data
+            except (OSError, ValueError):
+                continue
+        return {}
+
+    def _save_settings(self):
+        for p in self._settings_file_paths():
+            try:
+                with open(p, 'w', encoding='utf-8') as fh:
+                    json.dump(self.settings, fh)
+                return
+            except OSError:
+                continue
+
+    def _set_display(self):
+        """The game always draws at 1280x720; SCALED fills the window or the whole screen with it, keeping the
+        shape (black bars if the monitor is not 16:9)."""
+        flags = pygame.SCALED | (pygame.FULLSCREEN if self.fullscreen else 0)
+        try:
+            self.display = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), flags)
+        except pygame.error:                                  # no scaling support (e.g. no display at all)
+            self.display = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        # If the computer could not give us a 1280x720 canvas, draw to one of our own and scale it on screen
+        self.screen = self.display if self.display.get_size() == (SCREEN_WIDTH, SCREEN_HEIGHT) \
+            else pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT)).convert()
+        pygame.mouse.set_visible(not self.fullscreen)
+
+    def present(self):
+        """Puts the finished frame on the monitor (scaled with black bars when the screen is another size)."""
+        if self.screen is not self.display:
+            dw, dh = self.display.get_size()
+            k = min(dw / SCREEN_WIDTH, dh / SCREEN_HEIGHT)
+            w, h = int(SCREEN_WIDTH * k), int(SCREEN_HEIGHT * k)
+            self.display.fill((0, 0, 0))
+            self.display.blit(pygame.transform.smoothscale(self.screen, (w, h)), ((dw - w) // 2, (dh - h) // 2))
+        pygame.display.flip()
+
+    def toggle_fullscreen(self):
+        self.fullscreen = not self.fullscreen
+        self._set_display()
+        self.settings['fullscreen'] = self.fullscreen        # remembered for next time
+        self._save_settings()
 
     # ------------------------------------------------------------ profiles
     def slot_profile(self, slot):
@@ -3862,7 +4056,7 @@ class GameManager:
             if self.scene == 'UPDATE':
                 if self.updater.state == 'ready' and self.updater.apply():
                     self._render_frame()
-                    pygame.display.flip()
+                    self.present()
                     break                                          # the new version is starting; this one closes
                 if self.updater.state in ('done', 'off'):
                     self.scene = 'TITLE'
@@ -3876,7 +4070,7 @@ class GameManager:
                     self.keys_pressed = set()
                 self.keep_keys = False
             self._render_frame()                                      # 4. state translation + 5. render
-            pygame.display.flip()
+            self.present()
         pygame.quit()
 
     def _watch_performance(self):
@@ -3901,6 +4095,9 @@ class GameManager:
         K = pygame
         up, down = k in (K.K_w, K.K_UP), k in (K.K_s, K.K_DOWN)
         enter = k in (K.K_RETURN, K.K_KP_ENTER)
+        if k == K.K_F11 or (enter and pygame.key.get_mods() & K.KMOD_ALT):      # full screen, from anywhere
+            self.toggle_fullscreen()
+            return
         if self.scene == 'UPDATE':
             if k == K.K_ESCAPE:                                       # skip the update this time
                 self.updater.state = 'skipped'
@@ -3912,6 +4109,8 @@ class GameManager:
                 choice = self.TITLE_OPTIONS[self.title_sel]
                 if choice == "Quit":
                     self.running = False
+                elif choice == "Full Screen":
+                    self.toggle_fullscreen()
                 else:
                     self.scene = {'Local Play': 'MENU', 'Online': 'ONLINE'}.get(choice, 'PROFILES')
             elif k == K.K_ESCAPE:
@@ -4285,7 +4484,7 @@ class GameManager:
             scr.blit(dim, (0, 0))
             self.text(scr, "PAUSED", 90, WHITE, (SCREEN_WIDTH // 2, 70))
             self._render_controls(130)
-            self.text(scr, "ENTER / ESC resume      Q quit to menu      F1 show hitboxes", 26, (200, 210, 255),
+            self.text(scr, "ENTER / ESC resume      Q quit to menu      F1 show hitboxes      F11 full screen", 26, (200, 210, 255),
                       (SCREEN_WIDTH // 2, 580))
 
     def _render_duel(self, heads):
@@ -4410,13 +4609,15 @@ class GameManager:
             pygame.draw.polygon(scr, (255, 240, 180), star_points(SCREEN_WIDTH // 2 + sx, 196, 12 + 3 * math.sin(t * 0.08)))
         for i, opt in enumerate(self.TITLE_OPTIONS):
             sel = i == self.title_sel
-            r = pygame.Rect(0, 0, 400, 50)
-            r.center = (SCREEN_WIDTH // 2, 322 + i * 62)
+            r = pygame.Rect(0, 0, 400, 46)
+            r.center = (SCREEN_WIDTH // 2, 316 + i * 56)
             pygame.draw.rect(scr, (14, 10, 34) if sel else (70, 74, 96), r, border_radius=12)
             pygame.draw.rect(scr, (255, 220, 120) if sel else (40, 42, 60), r, 3, border_radius=12)
-            self.text(scr, opt, 36 if sel else 32,
+            if opt == "Full Screen":
+                opt = f"Full Screen:  {'On' if self.fullscreen else 'Off'}"
+            self.text(scr, opt, 34 if sel else 30,
                       (255, 226, 130) if sel else (226, 228, 240), r.center)
-        self.text(scr, "W / S  or  UP / DOWN to choose      ENTER to select", 20, (190, 190, 230), (SCREEN_WIDTH // 2, 704),
+        self.text(scr, "W / S  or  UP / DOWN to choose      ENTER to select      F11  full screen", 20, (190, 190, 230), (SCREEN_WIDTH // 2, 704),
                   shadow=False)
         self.text(scr, self.updater.status or f"version {GAME_VERSION}", 18, (190, 190, 230), (SCREEN_WIDTH - 12, 12), 'topright',
                   shadow=False)

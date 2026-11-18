@@ -29,12 +29,14 @@ python aether_clash.py
 | Grab | H | M or Numpad 4 |
 
 - Hold a direction while pressing Attack, Heavy or Special to get a different move (19 moves per fighter).
-- **Dash attacks:** while running, Attack is a quick hit that knocks the opponent away (good for making space),
-  and Heavy is a slow, telegraphed lunge that KOs at high damage. Watch for the glowing ring as it winds up.
+- **Dash attacks:** straight out of a dash or run, Attack is a quick hit that knocks the opponent away (good for
+  making space), and Heavy is a slow, telegraphed lunge that KOs at high damage. You keep your running speed and
+  slide into the hit, as in Smash. (Pressing a direction and Attack on the same frame still gives the forward tilt.)
 - After a grab: press a direction to throw that way, or Attack to pommel (small damage) first.
 - Down attacks have a small **spike spot**. Land it on an airborne rival and they are launched straight down.
 - Shield + left/right = roll. Shield in the air = air dodge.
 - Down = fast-fall, or drop through thin platforms. You grab ledges automatically; press Up to climb.
+- **F11** (or Alt+Enter, or Full Screen on the start menu) switches full screen on and off; the game remembers it.
 - Esc pauses and shows the controls. F1 shows hitboxes (spike spots in magenta). Gamepads are picked up automatically.
 
 ## Profiles
@@ -114,8 +116,27 @@ To make the lobby-server route work:
 
 ## Rules of the engine
 
-- Knockback: `Final Force = Base Force * (1.0 + Cumulative Damage / 200.0)`, then scaled by the target's weight.
-- Aether: gained by dealing and taking damage, slowly over time, and **+25 for a parry**. Specials spend it.
+Movement copies **Super Smash Bros. Ultimate**. Each fighter uses a real Ultimate fighter's movement values, taken
+from SmashWiki's attribute tables:
+
+| Fighter | Moves like | Notes |
+| --- | --- | --- |
+| Kai | Sheik | very fast run, quick 7-frame dash, high jumps, falls fast |
+| Bronn | Ganondorf | slow 15-frame dash, short jumps, heavy |
+| Nyx | Mewtwo | fast but floaty; Mewtwo's huge double jump is split over Nyx's two |
+| Rhea | Terry | grounded brawler with a quick run acceleration |
+
+What that means in play:
+
+- **Running:** tapping a direction gives an initial dash (a burst at a set speed) that you can reverse instantly
+  to dash-dance. After it you run, building up to top speed. Let go and you skid to a stop by your traction.
+- **Jumping:** 3 frames of crouch (jump squat) before you leave the ground. Hold jump for a full hop, tap it for a
+  short hop (about half as high). Full hops rise quickly at first, as in Ultimate.
+- **Falling:** fast-falling is 1.6x your falling speed. Landings have 2 frames of lag, or a little more after a
+  fast-fall.
+- **Getting hit:** launch speed decays by a fixed amount every frame and hitstun is 0.4x the knockback, as in Smash.
+  Knockback still follows `Final Force = Base Force * (1.0 + (Cumulative Damage / 200.0))`, scaled by weight.
+- **Aether:** gained by dealing and taking damage, slowly over time, and **+25 for a parry**. Specials spend it.
 - Everything is simulated in fixed 1/60 s frames, so move timings ("frame data") are exact and repeatable.
 
 ## Artwork
