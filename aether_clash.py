@@ -525,9 +525,9 @@ ROSTER = [
          alt=dict(main=(78, 82, 100), dark=(44, 46, 60), accent=(96, 206, 255), skin=(228, 162, 114),
                   flame=(40, 96, 230), band=(30, 32, 44), wrap=(190, 196, 210))),
 ]
-# The secret super move: a comically large gun that blasts the whole screen. Cannot be shielded.
-DEATH_RAY = S("Death Ray", 130, 0, hb(56, 60, 0, 0, 8000, 6000, 40, 21, 45, radial=True, unblockable=True),
-              impulses={0: (0, 0)}, intangible=(0, 112), no_gravity=(0, 112), effect=('deathray', 56))
+# The secret super move: a comically large gun.
+# Firing it ends the match in a win for whoever fired it (see Annihilation).
+DEATH_RAY = S("Death Ray", 130, 0, impulses={0: (0, 0)}, intangible=(0, 112), no_gravity=(0, 112), effect=('deathray', 56))
 DEATH_RAY.slot = 'deathray'
 
 for _spec in ROSTER:
@@ -689,7 +689,7 @@ class PhysicsEngine:
                 self.fx.shake = max(self.fx.shake, 2 + f // 9)
             elif f == m.effect[1]:
                 self.fx.shake = 36
-                self.fx.text(c.x, c.y - c.h - 70, "DEATH RAY!!", (255, 90, 90), 90)
+                self.combat_manager.nuke_by = c                   # the match ends here (see GameManager)
         if m.effect and f == m.effect[1] and m.effect[0] == 'ignite':
             c.buff_timer = 480
             self.fx.ring(c.x, c.y - c.h / 2, c.colors['accent'], 20, 9, 20)
@@ -1023,6 +1023,7 @@ class CombatManager:
         self.physics = physics_engine        # injected after construction (the two modules reference each other)
         self.fx = fx
         self.pending_duel = None             # set when two "crypticsh" players must duel for the Death Ray
+        self.nuke_by = None                  # set when someone fires the Death Ray: they win
 
     # ------------------------------------------------------------ starting / ending moves
     def process_attack(self, attacker, move):
@@ -3871,6 +3872,626 @@ class Updater:
 
 
 # =====================================================================
+# THE DEATH RAY ENDING (the crypticsh secret)
+# Firing the Death Ray ends the match on the spot, like calling in a nuke: the shooter wins and this
+# cinematic plays. The beam whites out the screen, the blast fills it with burning rock, then the camera pulls
+# back into space: the planet has been struck, molten cracks spread across it, it shakes, swells and bursts
+# apart along those cracks, and the title slams in.
+# =====================================================================
+try:
+    import numpy as np                       # used to render the planet as a shaded 3D sphere
+except ImportError:                          # without it the planet is drawn more simply
+    np = None
+
+
+def ease_out(u):
+    u = clamp(u, 0.0, 1.0)
+    return 1 - (1 - u) ** 3
+
+
+def ease_in(u):
+    u = clamp(u, 0.0, 1.0)
+    return u * u * u
+
+
+def soft_blob(surf, color, alpha, pos, r):
+    """A filled circle blended (not painted) onto a surface."""
+    r = max(1, int(r))
+    tmp = pygame.Surface((r * 2, r * 2), pygame.SRCALPHA)
+    pygame.draw.circle(tmp, (*color, alpha), (r, r), r)
+    surf.blit(tmp, (pos[0] - r, pos[1] - r))
+
+
+class Annihilation:
+    """The cinematic. Times are in frames (60 per second)."""
+    T_BLAST, T_SPACE, T_CRACK, T_BOOM, T_TEXT, T_END = 46, 104, 196, 420, 520, 1000
+    ER = 256                                  # radius of the planet image (it is scaled for the zoom)
+
+    def __init__(self, game, shooter):
+        self.g, self.shooter, self.t, self.done = game, shooter, 0, False
+        self.W, self.H = SCREEN_WIDTH, SCREEN_HEIGHT
+        self.rng = random.Random(4077)
+        self.name = shooter.player_name
+        R = self.ER
+        self.P = (R + 0.5 * R, R - 0.3 * R)   # where the blast struck the planet (on the planet image)
+        self.rot = 3.5                             # which side of the planet faces us
+        self._build_space()
+        self._build_blast()
+        self._build_earth()
+        self._build_cracks()
+        self.glow_layer = pygame.Surface((2 * R, 2 * R), pygame.SRCALPHA)
+        self.core_layer = pygame.Surface((2 * R, 2 * R), pygame.SRCALPHA)
+        self.seg_i = 0
+        self.comp = None
+        self.view = (self.W / 2, self.H / 2, R)
+        self.fragments, self.particles = None, []
+        self.boom_center = (self.W / 2, self.H / 2)
+        self.title = None
+        self.title_shake = 0
+
+    # ------------------------------------------------------------ building the pieces
+    def _build_space(self):
+        """A starfield with a band of the galaxy running across it."""
+        W, H, rng = self.W, self.H, self.rng
+        bg = pygame.Surface((W, H)).convert()
+        bg.fill((3, 3, 10))
+        a, b = (W * 0.80, -90), (W * 0.30, H + 90)
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        L = math.hypot(dx, dy)
+        nx, ny = -dy / L, dx / L
+        band = lambda u, off: (a[0] + dx * u + nx * off, a[1] + dy * u + ny * off)
+        for _ in range(150):                                   # glowing dust
+            glow(bg, rng.choice([(150, 118, 88), (112, 92, 80), (176, 150, 126)]),
+                 band(rng.random(), rng.gauss(0, 62)), rng.randint(24, 78), rng.randint(16, 34))
+        for _ in range(70):                                    # dark dust lanes through it
+            soft_blob(bg, (4, 2, 2), 70, band(rng.random(), rng.gauss(0, 22)), rng.randint(8, 30))
+        for i in range(1300):
+            x, y = band(rng.random(), rng.gauss(0, 75)) if i < 700 else (rng.uniform(0, W), rng.uniform(0, H))
+            base = rng.choice([(255, 255, 255), (200, 214, 255), (255, 232, 200)])
+            k = rng.uniform(0.2, 1.0) ** 1.6
+            col = tuple(int(v * k) for v in base)
+            if rng.random() < 0.025:
+                glow(bg, base, (x, y), 6, 90)
+                pygame.draw.circle(bg, base, (int(x), int(y)), 1)
+            elif 0 <= x < W and 0 <= y < H:
+                bg.set_at((int(x), int(y)), col)
+        self.space = bg
+        self.twinkle = [(rng.uniform(0, W), rng.uniform(0, H), rng.uniform(0, 6.3)) for _ in range(46)]
+
+    def _build_blast(self):
+        """The inside of the explosion: an orange glow and hot rocks flying past the camera."""
+        W, H, rng = self.W, self.H, self.rng
+        bg = pygame.Surface((W, H)).convert()
+        bg.fill((40, 6, 0))
+        for i in range(48):
+            u = i / 47
+            col = lerp_color((96, 16, 0), (255, 140, 40), u / 0.6) if u < 0.6 else \
+                lerp_color((255, 140, 40), (255, 246, 214), (u - 0.6) / 0.4)
+            pygame.draw.circle(bg, col, (W // 2, H // 2), int(820 * (1 - u) + 20))
+        self.blast_bg = bg
+        self.rocks = []
+        for _ in range(80):
+            size = rng.randint(10, 46)
+            self.rocks.append(dict(img=self._rock(size), a=rng.uniform(0, math.tau), d0=rng.uniform(0, 140),
+                                   v=rng.uniform(2.0, 9.0), acc=rng.uniform(0.05, 0.35), rot=rng.uniform(0, 360),
+                                   spin=rng.uniform(-5, 5), s0=rng.uniform(0.25, 0.7), grow=rng.uniform(0.01, 0.05),
+                                   delay=rng.randint(0, 22)))
+
+    def _rock(self, size):
+        rng = self.rng
+        n = rng.randint(6, 10)
+        angs = sorted(rng.uniform(0, math.tau) for _ in range(n))
+        c = size + 3
+        pts = [(c + math.cos(a) * size * rng.uniform(0.62, 1.0), c + math.sin(a) * size * rng.uniform(0.62, 1.0)) for a in angs]
+        s = pygame.Surface((c * 2, c * 2), pygame.SRCALPHA)
+        pygame.draw.polygon(s, (68, 40, 28), pts)
+        pygame.draw.polygon(s, (40, 22, 16), [(c + (x - c) * 0.6 + size * 0.15, c + (y - c) * 0.6 + size * 0.12) for x, y in pts])
+        for _ in range(3):                                     # glowing cracks in the rock
+            a = rng.uniform(0, math.tau)
+            p = (c + math.cos(a) * size * 0.2, c + math.sin(a) * size * 0.2)
+            q = (c + math.cos(a) * size * 0.8, c + math.sin(a) * size * 0.8)
+            pygame.draw.line(s, (255, 150, 50), p, q, 2)
+        pygame.draw.polygon(s, (255, 170, 70), pts, 2)         # white-hot edge
+        return s
+
+    def _build_earth(self):
+        R, n = self.ER, 2 * self.ER
+        if np is None:
+            self._fallback_earth()
+            return
+        rs = np.random.default_rng(11)
+        TW, TH = 512, 256
+
+        def noise(cw, ch):                                     # smooth value noise that wraps round the planet
+            g = rs.random((ch + 2, cw + 1)).astype(np.float32)
+            g[:, -1] = g[:, 0]
+            ys = np.linspace(0, ch, TH, dtype=np.float32)
+            xs = np.linspace(0, cw, TW, endpoint=False, dtype=np.float32)
+            y0, x0 = np.floor(ys).astype(int), np.floor(xs).astype(int)
+            fy, fx = ys - y0, xs - x0
+            fy, fx = (fy * fy * (3 - 2 * fy))[:, None], (fx * fx * (3 - 2 * fx))[None, :]
+            y1, x1 = np.minimum(y0 + 1, ch + 1), x0 + 1
+            a, b, c, d = g[y0][:, x0], g[y0][:, x1], g[y1][:, x0], g[y1][:, x1]
+            return (a * (1 - fx) + b * fx) * (1 - fy) + (c * (1 - fx) + d * fx) * fy
+
+        def fbm(cw, ch, octaves, gain=0.5):                    # several layers of detail
+            total, amp, norm = 0, 1.0, 0
+            for o in range(octaves):
+                total = total + noise(cw * 2 ** o, ch * 2 ** o) * amp
+                norm += amp
+                amp *= gain
+            return total / norm
+
+        f = fbm(6, 3, 6, 0.6)
+        thr = np.quantile(f, 0.68)
+        land = f > thr
+        lat = ((0.5 - (np.arange(TH) + 0.5) / TH) * np.pi)[:, None] * np.ones((1, TW), np.float32)
+        n2 = fbm(10, 5, 4)
+        deep_t = np.clip((thr - f) / 0.18, 0, 1)[..., None]
+        ocean = np.array([26, 90, 150], np.float32) * (1 - deep_t) + np.array([8, 26, 66], np.float32) * deep_t
+        dry = np.clip((0.3 - np.abs(np.abs(lat) - 0.4)) * 3.0 + (n2 - 0.5) * 0.9, 0, 1)[..., None]
+        height = np.clip((f - thr) / 0.2, 0, 1)[..., None]
+        landc = np.array([50, 98, 42], np.float32) * (1 - dry) + np.array([160, 138, 90], np.float32) * dry
+        landc = landc * (1 - 0.35 * height) + np.array([72, 74, 54], np.float32) * 0.35 * height
+        tex = np.where(land[..., None], landc, ocean)
+        ice = (np.abs(lat) + (n2 - 0.5) * 0.3) > 1.2
+        tex[ice] = (236, 242, 248)
+        cloud = fbm(8, 3, 5, 0.6)                             # stretched sideways, like weather bands
+        ca = (np.clip((cloud - 0.53) / 0.16, 0, 1) * 0.9)[..., None]
+        self.tex = (tex * (1 - ca) + 252 * ca).astype(np.float32)
+        cities = (noise(70, 35) > 0.62) & (rs.random((TH, TW)) < 0.35)
+        self.lights = (land & ~ice & cities).astype(np.float32) * (1 - ca[..., 0])
+        self.TW = TW
+        yy, xx = np.mgrid[0:n, 0:n].astype(np.float32)
+        x, y = (xx + 0.5 - R) / R, (yy + 0.5 - R) / R
+        rr = x * x + y * y
+        inside = rr < 1
+        z = np.sqrt(np.clip(1 - rr, 0, 1))
+        tilt = 0.4                                             # the planet's axis is tilted
+        y2, z2 = y * math.cos(tilt) - z * math.sin(tilt), y * math.sin(tilt) + z * math.cos(tilt)
+        self.iy = np.clip(((0.5 - np.arcsin(np.clip(-y2, -1, 1)) / np.pi) * TH).astype(int), 0, TH - 1)[inside]
+        self.lon = np.arctan2(x, z2)[inside]
+        L = np.array([-0.62, -0.34, 0.71], np.float32)        # sunlight from the upper left
+        L /= np.linalg.norm(L)
+        d = (x * L[0] + y * L[1] + z * L[2])[inside]
+        self.shade = (0.045 + 0.955 * np.clip(d, 0, 1))[:, None].astype(np.float32)
+        self.night = (np.clip(0.1 - d, 0, 0.35) / 0.35).astype(np.float32)
+        rim = ((1 - z) ** 2.6)[inside]
+        self.atmo = (rim[:, None] * np.array([70, 130, 255], np.float32) * (0.2 + 0.8 * np.clip(d + 0.25, 0, 1))[:, None]).astype(np.float32)
+        self.inside = inside
+        self.alpha = (np.clip((1 - np.sqrt(rr)) * R, 0, 1) * 255).astype(np.uint8)
+        rgba = np.zeros((n, n, 4), np.uint8)
+        rgba[..., :3] = 255
+        rgba[..., 3] = self.alpha
+        self.disc_white = pygame.image.frombytes(rgba.tobytes(), (n, n), 'RGBA').convert_alpha()
+        self.earth_img = self._render_earth()
+
+    def _render_earth(self):
+        if np is None:
+            return self.earth_img
+        n = 2 * self.ER
+        tx = ((self.lon + self.rot) * (self.TW / (2 * np.pi))).astype(int) % self.TW
+        col = self.tex[self.iy, tx] * self.shade
+        col += (self.lights[self.iy, tx] * self.night)[:, None] * np.array([255, 196, 110], np.float32)
+        col += self.atmo
+        out = np.zeros((n, n, 4), np.uint8)
+        out[self.inside, :3] = np.clip(col, 0, 255).astype(np.uint8)
+        out[..., 3] = self.alpha
+        return pygame.image.frombytes(out.tobytes(), (n, n), 'RGBA').convert_alpha()
+
+    def _fallback_earth(self):
+        R, rng, n = self.ER, self.rng, 2 * self.ER
+        disc = pygame.Surface((n, n), pygame.SRCALPHA)
+        pygame.draw.circle(disc, WHITE, (R, R), R)
+        s = pygame.Surface((n, n), pygame.SRCALPHA)
+        pygame.draw.circle(s, (20, 62, 124), (R, R), R)
+        for _ in range(30):
+            soft_blob(s, (52, 104, 46), 255, (rng.randint(0, n), rng.randint(0, n)), rng.randint(18, 70))
+        for _ in range(40):
+            soft_blob(s, (245, 248, 252), 150, (rng.randint(0, n), rng.randint(0, n)), rng.randint(8, 36))
+        soft_blob(s, (0, 0, 10), 190, (R + R * 0.55, R + R * 0.3), R * 1.05)      # night side
+        s.blit(disc, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        self.disc_white, self.earth_img = disc, s
+
+    def _build_cracks(self):
+        """A web of cracks centred on the impact: lines running outward and rings around it. The same lines
+        are later where the planet splits into pieces."""
+        R, rng, P = self.ER, self.rng, self.P
+        S, rings = 15, [0, 46, 114, 198, 300, 470]
+        base_a = [i * math.tau / S + rng.uniform(-0.15, 0.15) for i in range(S)]
+        V = {}
+        for i, r in enumerate(rings):
+            for j in range(S):
+                if i == 0:
+                    V[i, j] = P
+                else:
+                    a, d = base_a[j] + rng.uniform(-0.1, 0.1), r * rng.uniform(0.86, 1.14)
+                    V[i, j] = (P[0] + math.cos(a) * d, P[1] + math.sin(a) * d)
+        paths = {}
+
+        def edge(p, q, key):                                   # a jagged line, the same every time it is asked for
+            if key not in paths:
+                L = math.dist(p, q) or 1
+                nx, ny = -(q[1] - p[1]) / L, (q[0] - p[0]) / L
+                k = 5 if L > 60 else 3
+                pts = [p]
+                for m in range(1, k):
+                    u, off = m / k, rng.uniform(-0.13, 0.13) * L
+                    pts.append((p[0] + (q[0] - p[0]) * u + nx * off, p[1] + (q[1] - p[1]) * u + ny * off))
+                paths[key] = pts + [q]
+            return paths[key]
+
+        cells = []
+        for i in range(len(rings) - 1):
+            for j in range(S):
+                j2 = (j + 1) % S
+                a_ = edge(V[i, j], V[i + 1, j], ('r', i, j))
+                b_ = edge(V[i + 1, j], V[i + 1, j2], ('c', i + 1, j))
+                c_ = edge(V[i, j2], V[i + 1, j2], ('r', i, j2))
+                poly = a_ + b_[1:] + c_[::-1][1:]
+                if i > 0:
+                    poly += edge(V[i, j], V[i, j2], ('c', i, j))[::-1][1:-1]
+                cells.append(poly)
+        self.cells = cells
+        segs = []
+        for key, pts in paths.items():
+            for p, q in zip(pts, pts[1:]):
+                mid = ((p[0] + q[0]) / 2, (p[1] + q[1]) / 2)
+                if math.dist(mid, (R, R)) > R * 0.985:
+                    continue
+                if key[0] == 'r':
+                    birth = self.T_CRACK + math.dist(p, P) / 2.4
+                else:
+                    birth = self.T_CRACK + 30 + math.dist(mid, P) / 2.0 + rng.uniform(0, 14)
+                segs.append((birth, p, q, key[0]))
+        segs.sort(key=lambda s_: s_[0])
+        self.segs = segs
+        self.crater_j = [rng.uniform(0.72, 1.22) for _ in range(20)]
+
+    # ------------------------------------------------------------ running it
+    def step(self, fast=False):
+        t = self.t
+        if t < self.T_BLAST:                                   # the beam is still firing on the stage
+            sh = self.shooter
+            sh.move_frame = min(sh.move_frame + 1, 99)
+            self.g.fx.update()
+            self.g.fx.shake = 8 + t // 3
+        if self.T_SPACE - 2 <= t < self.T_BOOM:
+            if t < self.T_CRACK and not fast:                  # the planet turns until it starts to break
+                self.rot += 0.0018
+                if t % 2 == 0:
+                    self.earth_img = self._render_earth()
+            while self.seg_i < len(self.segs) and self.segs[self.seg_i][0] <= t:
+                self._draw_crack(*self.segs[self.seg_i])
+                self.seg_i += 1
+            self.comp = self._composite()
+            self.view = self._earth_view()
+        if t == self.T_BOOM:
+            self._boom()
+        if self.fragments is not None:
+            self._update_debris()
+        if t == self.T_TEXT + 10:
+            self.title_shake = 22
+        self.title_shake = max(0, self.title_shake - 1)
+        self.t += 1
+        if self.t >= self.T_END:
+            self.done = True
+
+    def skip(self):
+        """Enter skips ahead to the title, then to the results."""
+        if self.t < 20:
+            return
+        if self.t >= self.T_TEXT:
+            self.done = True
+            return
+        while self.t < self.T_TEXT:
+            self.step(fast=True)
+
+    def _draw_crack(self, birth, p, q, kind):
+        big = kind == 'r'
+        pygame.draw.line(self.glow_layer, (120, 22, 6, 160), p, q, 8 if big else 6)
+        pygame.draw.line(self.glow_layer, (255, 96, 24, 235), p, q, 4 if big else 3)
+        pygame.draw.line(self.core_layer, (255, 230, 150, 255), p, q, 2 if big else 1)
+
+    def _composite(self):
+        """The planet as it is now: heating up red, with its cracks and the burning crater."""
+        t, P = self.t, self.P
+        comp = self.earth_img.copy()
+        heat = ease_in((t - self.T_CRACK) / (self.T_BOOM - self.T_CRACK))
+        if heat > 0:
+            comp.fill((255, int(255 - 80 * heat), int(255 - 120 * heat)), special_flags=pygame.BLEND_RGB_MULT)
+        comp.blit(self.glow_layer, (0, 0))
+        comp.blit(self.core_layer, (0, 0))
+        if heat > 0.25 and math.sin(t * 0.35) > 0:             # the cracks pulse brighter and brighter
+            comp.blit(self.core_layer, (0, 0), special_flags=pygame.BLEND_RGB_ADD)
+        cr = (7 + 30 * ease_out((t - self.T_SPACE) / 170)) * (1 + 0.05 * math.sin(t * 0.5))
+        for scale, col in ((1.3, (96, 20, 6)), (1.0, (232, 82, 22)), (0.7, (255, 172, 64)), (0.4, (255, 242, 196))):
+            pts = [(P[0] + math.cos(i * math.tau / 20) * cr * scale * self.crater_j[i],
+                    P[1] + math.sin(i * math.tau / 20) * cr * scale * self.crater_j[i] * 0.9) for i in range(20)]
+            pygame.draw.polygon(comp, col, pts)
+        comp.blit(self.disc_white, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)   # nothing outside the planet
+        return comp
+
+    def _earth_view(self):
+        """Where the planet is on screen: first very close on the impact, then pulling back to see it whole."""
+        t, R, P = self.t, self.ER, self.P
+        u = ease_out((t - self.T_SPACE) / 160)
+        rad = 820 + (262 - 820) * u
+        rad *= 1 - 0.035 * clamp((t - 240) / 180, 0, 1)
+        if t > self.T_BOOM - 20:                               # it swells just before it bursts
+            rad *= 1 + 0.07 * ease_in((t - (self.T_BOOM - 20)) / 20)
+        k, focus = rad / R, 1 - u
+        cx = self.W / 2 - (P[0] - R) * k * focus
+        cy = self.H / 2 - (P[1] - R) * k * focus
+        amp = 11 * ease_in((t - 250) / (self.T_BOOM - 250))
+        if amp > 0.3:
+            cx += self.rng.uniform(-amp, amp)
+            cy += self.rng.uniform(-amp, amp)
+        return cx, cy, rad
+
+    def _boom(self):
+        """The planet bursts along its cracks into burning pieces."""
+        R, rng = self.ER, self.rng
+        cx, cy, rad = self.view
+        k = rad / R
+        self.boom_center, self.boom_k = (cx, cy), k
+        frags = []
+        for poly in self.cells:
+            xs, ys = [p[0] for p in poly], [p[1] for p in poly]
+            box = pygame.Rect(int(min(xs)) - 2, int(min(ys)) - 2, int(max(xs) - min(xs)) + 5, int(max(ys) - min(ys)) + 5)
+            box = box.clip(pygame.Rect(0, 0, 2 * R, 2 * R))   # (the rest of the cell is empty space)
+            if box.w < 3 or box.h < 3:
+                continue
+            bx, by, bw, bh = box
+            local = [(x - bx, y - by) for x, y in poly]
+            s = pygame.Surface((bw, bh), pygame.SRCALPHA)
+            s.blit(self.comp, (0, 0), box)
+            cut = pygame.Surface((bw, bh), pygame.SRCALPHA)
+            pygame.draw.polygon(cut, WHITE, local)
+            s.blit(cut, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)           # just this piece
+            pygame.draw.lines(s, (255, 150, 50), True, local, 3)                # molten edges
+            pygame.draw.lines(s, (255, 236, 170), True, local, 1)
+            s.blit(self.disc_white, (0, 0), box, special_flags=pygame.BLEND_RGBA_MULT)
+            if pygame.mask.from_surface(s, 40).count() < 60:
+                continue
+            mx, my = bx + bw / 2, by + bh / 2
+            dx, dy = mx - R, my - R
+            d = math.hypot(dx, dy) or 1
+            sp = (0.7 + rng.uniform(0, 2.6)) * (0.5 + d / R) * k * 0.9
+            img = pygame.transform.smoothscale(s, (max(1, int(bw * k)), max(1, int(bh * k))))
+            frags.append(dict(img=img, x=cx + dx * k, y=cy + dy * k, vx=dx / d * sp, vy=dy / d * sp,
+                              ang=0.0, spin=rng.uniform(-2.2, 2.2)))
+        self.fragments = frags
+        for _ in range(650):                                   # burning debris in every direction
+            a, sp = rng.uniform(0, math.tau), rng.expovariate(1 / 4.2) + 0.6
+            self.particles.append([cx + math.cos(a) * rad * 0.2, cy + math.sin(a) * rad * 0.2, math.cos(a) * sp,
+                                   math.sin(a) * sp * 0.85, rng.randint(160, 520), 0,
+                                   rng.choice([(255, 210, 120), (255, 140, 50), (255, 90, 30), (150, 140, 130)]),
+                                   rng.choice([1, 1, 2, 2, 3])])
+
+    def _update_debris(self):
+        rng = self.rng
+        for f in self.fragments:
+            f['x'] += f['vx']
+            f['y'] += f['vy']
+            f['vx'] *= 0.996
+            f['vy'] *= 0.996
+            f['ang'] += f['spin']
+            if self.t - self.T_BOOM < 140 and rng.random() < 0.3:                   # fire trailing behind
+                self.particles.append([f['x'], f['y'], -f['vx'] * 0.2 + rng.uniform(-0.4, 0.4),
+                                       -f['vy'] * 0.2 + rng.uniform(-0.4, 0.4), rng.randint(20, 50), 0,
+                                       rng.choice([(255, 160, 60), (255, 100, 30)]), 2])
+        for p in self.particles:
+            p[0] += p[2]
+            p[1] += p[3]
+            p[2] *= 0.993
+            p[3] *= 0.993
+            p[5] += 1
+        self.particles = [p for p in self.particles if p[5] < p[4]]
+
+    # ------------------------------------------------------------ drawing it
+    def render(self, scr, text=True):
+        t = self.t
+        if t < self.T_BLAST:                                   # the stage has been drawn; the beam whites it out
+            a = int(255 * ease_in((t - 4) / (self.T_BLAST - 6)))
+            if a > 0:
+                ov = pygame.Surface((self.W, self.H))
+                ov.fill((255, 246, 230))
+                ov.set_alpha(a)
+                scr.blit(ov, (0, 0))
+            return
+        if t < self.T_SPACE:
+            self._render_blast(scr)
+            return
+        self._render_space(scr)
+        if t >= self.T_TEXT and text:
+            self._render_text(scr)
+
+    def _render_blast(self, scr):
+        t, W, H = self.t - self.T_BLAST, self.W, self.H
+        dur = self.T_SPACE - self.T_BLAST
+        sh = int(14 * (1 - t / dur))
+        ox, oy = self.rng.randint(-sh, sh), self.rng.randint(-sh, sh)
+        scr.blit(self.blast_bg, (ox, oy))
+        glow(scr, (255, 240, 200), (W // 2 + ox, H // 2 + oy), 260 + t * 6, 150)
+        for r in self.rocks:                                   # hot rock flying out past the camera
+            tt = t - r['delay']
+            if tt < 0:
+                continue
+            dist = r['d0'] + r['v'] * tt + r['acc'] * tt * tt
+            sc = r['s0'] * (1 + r['grow'] * tt) ** 2
+            img = pygame.transform.rotozoom(r['img'], r['rot'] + r['spin'] * tt, sc)
+            x, y = W / 2 + math.cos(r['a']) * dist + ox, H / 2 + math.sin(r['a']) * dist * 0.8 + oy
+            scr.blit(img, img.get_rect(center=(x, y)))
+        rng = random.Random(t)                                 # embers streaking outward
+        for _ in range(60):
+            a, d = rng.uniform(0, math.tau), rng.uniform(40, 700) + t * 6
+            p = (W / 2 + math.cos(a) * d, H / 2 + math.sin(a) * d * 0.8)
+            q = (W / 2 + math.cos(a) * (d - 26), H / 2 + math.sin(a) * (d - 26) * 0.8)
+            pygame.draw.line(scr, rng.choice([(255, 220, 140), (255, 150, 60)]), q, p, 2)
+        if t < 16:                                             # out of the white
+            ov = pygame.Surface((W, H))
+            ov.fill((255, 246, 230))
+            ov.set_alpha(int(255 * (1 - t / 16)))
+            scr.blit(ov, (0, 0))
+        if t > dur - 10:                                       # into the white again: cut to space
+            ov = pygame.Surface((W, H))
+            ov.fill((255, 246, 230))
+            ov.set_alpha(int(255 * (t - (dur - 10)) / 10))
+            scr.blit(ov, (0, 0))
+
+    def _blit_planet(self, scr, img, cx, cy, rad):
+        """Scales just the visible part of the planet image onto the screen (it can be huge when zoomed in)."""
+        R = self.ER
+        k = rad / R
+        full = pygame.Rect(int(cx - rad), int(cy - rad), int(2 * rad), int(2 * rad))
+        vis = full.clip(scr.get_rect())
+        if vis.w <= 0 or vis.h <= 0:
+            return
+        src = pygame.Rect(int((vis.x - full.x) / k), int((vis.y - full.y) / k), int(vis.w / k) + 2, int(vis.h / k) + 2)
+        src = src.clip(img.get_rect())
+        if src.w <= 0 or src.h <= 0:
+            return
+        size = (max(1, int(src.w * k)), max(1, int(src.h * k)))
+        part = img.subsurface(src)
+        part = pygame.transform.smoothscale(part, size)
+        scr.blit(part, (full.x + src.x * k, full.y + src.y * k))
+
+    def _render_space(self, scr):
+        t, W, H, R = self.t, self.W, self.H, self.ER
+        scr.blit(self.space, (0, 0))
+        for x, y, ph in self.twinkle:
+            k = 0.5 + 0.5 * math.sin(t * 0.06 + ph)
+            pygame.draw.polygon(scr, lerp_color((40, 40, 70), WHITE, k), star_points(x, y, 2 + 3 * k))
+        u = ease_out((t - self.T_SPACE) / 160)
+        if u > 0.6:                                            # the moon, far off
+            mx, my = W * 0.105, H * 0.25
+            pygame.draw.circle(scr, (150, 152, 162), (int(mx), int(my)), 11)
+            pygame.draw.circle(scr, (40, 40, 52), (int(mx + 5), int(my + 2)), 9)
+            pygame.draw.circle(scr, (190, 190, 200), (int(mx - 4), int(my - 3)), 3)
+        if self.fragments is None:
+            cx, cy, rad = self.view
+            if rad < 520:                                      # the glow of the atmosphere
+                glow(scr, (110, 170, 255), (cx, cy), rad * 1.09, 120)
+            heat = ease_in((t - self.T_CRACK) / (self.T_BOOM - self.T_CRACK))
+            if heat > 0.05:                                    # it begins to glow from inside
+                glow(scr, (255, 110, 30), (cx, cy), rad * (1.08 + 0.12 * heat), int(150 * heat))
+            if self.comp is not None:
+                self._blit_planet(scr, self.comp, cx, cy, rad)
+            k = rad / R
+            ix, iy = cx + (self.P[0] - R) * k, cy + (self.P[1] - R) * k
+            tt = t - self.T_SPACE
+            if tt < 60:                                        # the blast still burning where it struck
+                glow(scr, (255, 236, 190), (ix, iy), 40 + (420 - 40) * (1 - ease_out(tt / 60)), int(230 * (1 - tt / 60)))
+            glow(scr, (255, 120, 40), (ix, iy), 34 * k * (1 + 0.1 * math.sin(t * 0.4)), 120)
+            if tt < 14:
+                ov = pygame.Surface((W, H))
+                ov.fill((255, 246, 230))
+                ov.set_alpha(int(255 * (1 - tt / 14)))
+                scr.blit(ov, (0, 0))
+            return
+        tt = t - self.T_BOOM
+        bx, by = self.boom_center
+        r = min(560, 30 + 13 * tt)                             # the fireball where the planet was
+        for scale, col, a in ((1.35, (120, 30, 10), 130 - tt), (1.0, (255, 140, 40), 230 - int(tt * 2.2)),
+                              (0.5, (255, 244, 210), 255 - tt * 6)):
+            if a > 0:
+                glow(scr, col, (bx, by), max(4, r * scale), a)
+        for f in self.fragments:                               # the pieces of the planet
+            fade = clamp(1 - (tt - 260) / 260, 0, 1)
+            if fade <= 0:
+                continue
+            img = pygame.transform.rotate(f['img'], f['ang'])
+            if fade < 1:
+                img.set_alpha(int(255 * fade))
+            scr.blit(img, img.get_rect(center=(f['x'], f['y'])))
+        if not hasattr(self, 'ov'):
+            self.ov = pygame.Surface((W, H), pygame.SRCALPHA)
+        ov = self.ov
+        ov.fill((0, 0, 0, 0))
+        for delay, speed, col in ((4, 26, (255, 214, 160)), (14, 18, (150, 190, 255))):      # shockwaves
+            q = tt - delay
+            if q > 0:
+                w = 40 + speed * q
+                a = max(0, 235 - int(q * 1.7))
+                if a > 0:
+                    rect = pygame.Rect(0, 0, int(w), int(w * 0.2))
+                    rect.center = (int(bx), int(by))
+                    pygame.draw.ellipse(ov, (*col, a), rect, max(2, int(9 - q * 0.04)))
+        for p in self.particles:                               # debris and embers
+            life = 1 - p[5] / p[4]
+            col = lerp_color((60, 40, 40), p[6], life)
+            if abs(p[2]) + abs(p[3]) > 2.5:
+                pygame.draw.line(ov, (*col, int(255 * life)), (p[0], p[1]), (p[0] - p[2] * 1.8, p[1] - p[3] * 1.8), p[7])
+            else:
+                pygame.draw.circle(ov, (*col, int(255 * life)), (int(p[0]), int(p[1])), p[7])
+        scr.blit(ov, (0, 0))
+        if tt < 34:                                            # the flash
+            fl = pygame.Surface((W, H))
+            fl.fill((255, 250, 240))
+            fl.set_alpha(int(255 * (1 - tt / 34) ** 2))
+            scr.blit(fl, (0, 0))
+
+    def _build_title(self):
+        f = pygame.font.Font(None, 178)
+        word = "ANNIHILATION"
+        mask = f.render(word, True, WHITE)
+        w, h = mask.get_size()
+        grad = pygame.Surface((w, h), pygame.SRCALPHA)
+        for y in range(h):                                     # bloody metal: bright at the top, dark below
+            u = y / h
+            col = lerp_color((255, 128, 96), (206, 22, 12), u / 0.5) if u < 0.5 else \
+                lerp_color((206, 22, 12), (84, 0, 0), (u - 0.5) / 0.5)
+            if 0.26 < u < 0.34:
+                col = lerp_color(col, (255, 226, 206), 0.6)
+            pygame.draw.line(grad, col, (0, y), (w, y))
+        grad.blit(mask, (0, 0), special_flags=pygame.BLEND_RGBA_MULT)
+        pad = 14
+        out = pygame.Surface((w + pad * 2, h + pad * 2), pygame.SRCALPHA)
+        dark, gold = f.render(word, True, (26, 0, 0)), f.render(word, True, (255, 194, 86))
+        for dx in range(-7, 8, 2):
+            for dy in range(-7, 8, 2):
+                if dx * dx + dy * dy <= 49:
+                    out.blit(dark, (pad + dx, pad + dy))
+        for a in range(12):
+            out.blit(gold, (pad + round(math.cos(a * math.tau / 12) * 2.5), pad + round(math.sin(a * math.tau / 12) * 2.5)))
+        out.blit(grad, (pad, pad))
+        self.title = out
+        sub = self.g.font(60).render(f"{self.name.upper()} WINS", True, (255, 214, 120))
+        self.sub = sub
+
+    def _render_text(self, scr):
+        if self.title is None:
+            self._build_title()
+        t, W, H = self.t - self.T_TEXT, self.W, self.H
+        if not hasattr(self, 'tint'):                          # the sky burns orange behind the title
+            self.tint = pygame.Surface((W, H)).convert()
+            self.tint.fill((150, 40, 0))
+        self.tint.set_alpha(int(110 * ease_out(t / 50)))
+        scr.blit(self.tint, (0, 0))
+        if t < 10:                                             # the title slams down
+            sc = 1 + 2.6 * (1 - ease_out(t / 10))
+            img = pygame.transform.rotozoom(self.title, 0, sc)
+            img.set_alpha(int(255 * min(1, t / 6)))
+        else:
+            img = self.title
+        sh = self.title_shake
+        ox, oy = (self.rng.randint(-sh, sh), self.rng.randint(-sh, sh)) if sh else (0, 0)
+        scr.blit(img, img.get_rect(center=(W // 2 + ox, int(H * 0.42) + oy)))
+        if t >= 22:                                            # the winner's banner slides in
+            u = ease_out((t - 22) / 16)
+            bw, bh = self.sub.get_width() + 140, 84
+            bar = pygame.Rect(0, 0, bw, bh)
+            bar.center = (int(-bw / 2 + (W / 2 + bw / 2) * u), int(H * 0.42) + 120)
+            pygame.draw.rect(scr, (40, 0, 0), bar.inflate(10, 10))
+            pygame.draw.rect(scr, (140, 12, 10), bar)
+            pygame.draw.rect(scr, (190, 40, 30), bar.inflate(-8, -40).move(0, -18))
+            pygame.draw.rect(scr, (255, 190, 80), bar, 3)
+            scr.blit(self.sub, self.sub.get_rect(center=bar.center))
+        if t >= 70 and (t // 30) % 2 == 0:
+            self.g.text(scr, "ENTER  continue", 30, (255, 220, 160), (W // 2, H - 60))
+
+# =====================================================================
 # 5. GAME MANAGER (Module 5 - The Loop)
 # =====================================================================
 
@@ -4039,6 +4660,7 @@ class GameManager:
             self.controllers[slot + 1] = ctrl
         self.scene, self.paused = 'FIGHT', False
         self.intro, self.end_timer, self.winner, self.frame, self.duel = 100, 0, None, 0, None
+        self.cine = None
         self.netmatch = NetMatch(online['slot']) if online else None
         self.rng = random.Random(online['seed']) if online else random.Random()
         self.local_device = KeyboardDevice(self.slot_keymap(0), self, self.joysticks[0] if self.joysticks else None) if online else None
@@ -4145,6 +4767,9 @@ class GameManager:
                 self._online_back_to_room("You left the match.")
             elif k == K.K_F1:
                 self.show_boxes = not self.show_boxes
+        elif self.scene == 'CINEMATIC':
+            if enter or k in (K.K_SPACE, K.K_ESCAPE):
+                self.cine.skip()
         elif self.scene == 'RESULT' and self.netmatch:
             if enter or k in (K.K_SPACE, K.K_ESCAPE):
                 self._online_back_to_room("")
@@ -4222,6 +4847,11 @@ class GameManager:
     def _step(self):
         """One 60th of a second of game time."""
         self.frame += 1
+        if self.scene == 'CINEMATIC':
+            self.cine.step()
+            if self.cine.done:
+                self.scene = 'RESULT'
+            return
         if self.scene == 'ONLINE' or (self.netmatch and self.scene == 'RESULT'):
             self._online_update()
         if self.scene != 'FIGHT' or self.paused:
@@ -4252,6 +4882,9 @@ class GameManager:
                 return
         self.physics_engine.update_all()                              # 2. physics (calls combat on hits)
         self.combat_manager.check_all_move_durations()                # 3. combat timers / state machine
+        if self.combat_manager.nuke_by is not None:                   # the Death Ray went off: game over
+            self._start_annihilation(self.combat_manager.nuke_by)
+            return
         self.fx.update()
         self._ambient()
         self._update_camera()
@@ -4259,6 +4892,17 @@ class GameManager:
             alive = [c for c in self.characters.values() if c.current_lives > 0]
             self.winner = alive[0] if alive else None
             self.end_timer = 170
+
+    def _start_annihilation(self, shooter):
+        """Ends the match: the shooter wins, everyone else is wiped out, and the cinematic plays."""
+        self.combat_manager.nuke_by = None
+        for c in self.characters.values():
+            if c is not shooter:
+                c.current_lives = 0
+                shooter.kos += 1
+        self.winner, self.end_timer, self.duel = shooter, 0, None
+        self.cine = Annihilation(self, shooter)
+        self.scene = 'CINEMATIC'
 
     # ------------------------------------------------------------ the Death Ray duel (both players "crypticsh")
     def _new_prompt(self, last=None):
@@ -4316,13 +4960,19 @@ class GameManager:
                 self.fx.spark(x, y, pal['soft'], 1, 0.6, 70, 3, grav=-0.01)
 
     def _update_camera(self):
-        pts = [(c.x, c.y - c.h / 2) for c in self.characters.values() if c.current_state != "KO"]
-        if not pts:
-            pts = [self.map_data.respawn]
-        pts.append((WORLD_W / 2, self.map_data.top - 120))
+        ray = next((c for c in self.characters.values() if c.current_move is DEATH_RAY), None)
+        if ray:                                                # close in on whoever is firing the Death Ray
+            pts = [(ray.x, ray.y - ray.h / 2), (ray.x + ray.facing * 330, ray.y - ray.h / 2)]
+            minw = 700
+        else:
+            pts = [(c.x, c.y - c.h / 2) for c in self.characters.values() if c.current_state != "KO"]
+            if not pts:
+                pts = [self.map_data.respawn]
+            pts.append((WORLD_W / 2, self.map_data.top - 120))
+            minw = 860
         x0, x1 = min(p[0] for p in pts) - 250, max(p[0] for p in pts) + 250
         y0, y1 = min(p[1] for p in pts) - 210, max(p[1] for p in pts) + 190
-        w = clamp(max(x1 - x0, (y1 - y0) * 16 / 9, 860), 860, WORLD_W)
+        w = clamp(max(x1 - x0, (y1 - y0) * 16 / 9, minw), minw, WORLD_W)
         tx, ty = (x0 + x1) / 2 - w / 2, (y0 + y1) / 2 - w * 9 / 32
         for i, target in enumerate((tx, ty, w)):
             self.camf[i] += (target - self.camf[i]) * 0.08
@@ -4402,6 +5052,26 @@ class GameManager:
             {'ONLINE': self._render_online,
              'PROFILES': self._render_profiles, 'MENU': self._render_menu}[scene]()
             return
+        if self.cine is not None and (scene == 'CINEMATIC' or self.cine.t >= Annihilation.T_SPACE):
+            if self.cine.t < Annihilation.T_BLAST:
+                self._render_world_view()
+            self.cine.render(self.screen, text=scene == 'CINEMATIC')
+            if scene == 'RESULT':
+                self._render_result()
+            return
+        view = self._render_world_view()
+        self._render_hud(view)
+        for c in self.characters.values():                           # the Death Ray coming out: cinematic bars
+            if c.current_move is DEATH_RAY:
+                bar = int(78 * ease_out(c.move_frame / 18))
+                pygame.draw.rect(self.screen, (0, 0, 0), (0, 0, SCREEN_WIDTH, bar))
+                pygame.draw.rect(self.screen, (0, 0, 0), (0, SCREEN_HEIGHT - bar, SCREEN_WIDTH, bar))
+                if c.move_frame > 8 and (c.move_frame // 6) % 2:
+                    self.text(self.screen, "DEATH RAY", 64, (255, 70, 70), (SCREEN_WIDTH // 2, 40))
+        if scene == 'RESULT':
+            self._render_result()
+
+    def _render_world_view(self):
         view = self.cam.copy()
         if self.fx.shake and not self.paused:
             view.move_ip(random.randint(-self.fx.shake, self.fx.shake), random.randint(-self.fx.shake, self.fx.shake))
@@ -4412,18 +5082,11 @@ class GameManager:
             self.lowres = pygame.Surface((SCREEN_WIDTH // PIXEL, SCREEN_HEIGHT // PIXEL)).convert()
         pygame.transform.smoothscale(self.world.subsurface(view), self.lowres.get_size(), self.lowres)
         pygame.transform.scale(self.lowres, (SCREEN_WIDTH, SCREEN_HEIGHT), self.screen)
-        self._render_hud(view)
-        if scene == 'RESULT':
-            self._render_result()
+        return view
 
     # ------------------------------------------------------------ in-match HUD
     def _render_hud(self, view):
         scr, scale = self.screen, SCREEN_WIDTH / view.w
-        for c in self.characters.values():                           # the Death Ray whites out the whole screen
-            if c.current_move is DEATH_RAY and 56 <= c.move_frame < 80:
-                flash = pygame.Surface((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.SRCALPHA)
-                flash.fill((255, 235, 235, int(235 * (80 - c.move_frame) / 24)))
-                scr.blit(flash, (0, 0))
         heads = {}
         for c in self.characters.values():                           # name tags above the fighters
             if c.current_state == "KO":
@@ -5059,6 +5722,15 @@ def run_selftest(frames=3600):
             f += 1
             if f % 240 == 0 or (secret and f % 7 == 0):
                 game._render_frame()
+        if game.scene == 'CINEMATIC':
+            cf = 0
+            while game.scene == 'CINEMATIC':
+                game._step()
+                cf += 1
+                if cf % 3 == 0:
+                    game._render_frame()
+            game._render_frame()
+            print(f"    Death Ray fired: {cf}-frame ending played, winner {game.winner.player_name} ({game.winner.name})")
         c1, c2 = game.characters[1], game.characters[2]
         print(f"{game.map_data.name:20s} {c1.name:5s} vs {c2.name:5s}: {f:5d} frames | lives {c1.current_lives}-{c2.current_lives}"
               f" | dmg {c1.cumulative_damage_taken:5.0f}% {c2.cumulative_damage_taken:5.0f}%"
