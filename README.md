@@ -28,7 +28,9 @@ python aether_clash.py
 | Shield (tap just before a hit = parry) | Left Shift or I | Right Shift or Numpad Enter |
 | Grab | H | M or Numpad 4 |
 
-- Hold a direction while pressing Attack, Heavy or Special to get a different move (18 moves per fighter).
+- Hold a direction while pressing Attack, Heavy or Special to get a different move (19 moves per fighter).
+- **Dash attacks:** while running, Attack is a quick hit that knocks the opponent away (good for making space),
+  and Heavy is a slow, telegraphed lunge that KOs at high damage. Watch for the glowing ring as it winds up.
 - After a grab: press a direction to throw that way, or Attack to pommel (small damage) first.
 - Down attacks have a small **spike spot**. Land it on an airborne rival and they are launched straight down.
 - Shield + left/right = roll. Shield in the air = air dodge.

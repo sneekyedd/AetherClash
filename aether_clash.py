@@ -327,7 +327,8 @@ KAI_MOVE_SET = dict(
     ftilt=A("Thread Slash", 22, hb(5, 8, 48, -4, 64, 30, 7, 9, 35)),
     utilt=A("Crescent Stitch", 22, hb(4, 9, 10, -52, 70, 50, 6, 9, 85)),
     dtilt=A("Low Hem", 18, hb(4, 6, 44, 30, 60, 18, 5, 8, 75)),
-    dash=A("Slipknot", 28, hb(5, 12, 34, 6, 56, 34, 7, 10, 60), impulses={0: (11, None)}),
+    dash=A("Slipknot", 26, hb(5, 11, 34, 4, 58, 34, 6, 11.5, 38), impulses={0: (11, None)}),
+    dashheavy=A("Seamrender", 50, hb(22, 26, 52, -4, 80, 46, 17, 19.5, 40), impulses={0: (8, None), 20: (16, None)}),
     fsmash=A("Burst Strike", 40, hb(12, 15, 58, -6, 76, 40, 15, 16.5, 38)),
     usmash=A("Spindle Rise", 40, hb(9, 14, 6, -64, 60, 70, 13, 16, 88)),
     dsmash=A("Seam Splitter", 42, hb(8, 9, 74, 28, 26, 24, 13, 13, 25, spike=True), hb(8, 9, -74, 28, 26, 24, 13, 13, 155, spike=True),
@@ -352,7 +353,9 @@ BRONN_MOVE_SET = dict(
     ftilt=A("Shield Bash", 30, hb(9, 13, 54, -6, 64, 48, 11, 12, 35)),
     utilt=A("Lintel Lift", 30, hb(8, 13, 8, -66, 84, 48, 10, 12, 88)),
     dtilt=A("Foundation Kick", 26, hb(7, 10, 52, 36, 70, 22, 9, 10, 30)),
-    dash=A("Rampart Rush", 40, hb(8, 18, 40, 0, 60, 70, 12, 13, 50), impulses={0: (10, None)}, armor=(4, 16)),
+    dash=A("Rampart Rush", 36, hb(8, 16, 40, 0, 60, 70, 10, 12.5, 40), impulses={0: (10, None)}, armor=(4, 14)),
+    dashheavy=A("Avalanche Charge", 62, hb(26, 32, 58, -6, 92, 84, 22, 20.5, 42), impulses={0: (8, None), 24: (14, None)},
+                armor=(10, 32)),
     fsmash=A("Keystone Hammer", 54, hb(20, 24, 70, -10, 90, 70, 22, 19, 40), armor=(14, 24)),
     usmash=A("Tower Crown", 50, hb(15, 21, 0, -70, 100, 100, 19, 18, 90)),
     dsmash=A("Ground Slam", 56, hb(18, 19, 100, 34, 36, 40, 21, 15, 80, spike=True), hb(18, 19, -100, 34, 36, 40, 21, 15, 100, spike=True),
@@ -379,7 +382,8 @@ NYX_MOVE_SET = dict(
     ftilt=A("Orbit Swipe", 26, hb(7, 11, 56, -6, 74, 30, 8, 10, 35)),
     utilt=A("Halo", 26, hb(6, 12, 0, -60, 90, 36, 7, 9.5, 90)),
     dtilt=A("Umbral Sweep", 22, hb(5, 8, 50, 32, 72, 18, 6, 8, 80)),
-    dash=A("Comet Slide", 32, hb(6, 14, 36, 10, 60, 36, 8, 10, 65), impulses={0: (10, None)}),
+    dash=A("Comet Slide", 30, hb(6, 13, 36, 8, 62, 36, 7, 11, 38), impulses={0: (10, None)}),
+    dashheavy=A("Supernova Rush", 54, hb(22, 27, 50, -6, 96, 90, 17, 19.5, 42), impulses={0: (9, None), 20: (15, None)}),
     fsmash=A("Nova Lance", 46, hb(15, 18, 80, -8, 120, 30, 16, 17, 35)),
     usmash=A("Zenith Flare", 46, hb(12, 18, 0, -76, 70, 110, 15, 16.5, 90)),
     dsmash=A("Eclipse Ring", 48, hb(10, 11, 92, 26, 30, 38, 14, 13, 30, spike=True), hb(10, 11, -92, 26, 30, 38, 14, 13, 150, spike=True),
@@ -406,7 +410,8 @@ RHEA_MOVE_SET = dict(
     ftilt=A("Ember Hook", 24, hb(6, 9, 44, -8, 52, 36, 9, 10.5, 40)),
     utilt=A("Flare Upper", 24, hb(5, 10, 14, -50, 50, 64, 8, 10, 85)),
     dtilt=A("Coal Sweep", 20, hb(5, 8, 44, 32, 60, 20, 7, 8.5, 70)),
-    dash=A("Wildfire Knee", 30, hb(5, 13, 34, -2, 50, 50, 10, 11.5, 55), impulses={0: (12, None)}),
+    dash=A("Wildfire Knee", 28, hb(5, 12, 34, -2, 50, 50, 8, 12, 40), impulses={0: (12, None)}),
+    dashheavy=A("Meteor Rush", 52, hb(20, 24, 50, -6, 72, 60, 20, 19.5, 40), impulses={0: (9, None), 18: (17, None)}),
     fsmash=A("Kiln Breaker", 46, hb(14, 18, 56, -8, 70, 50, 19, 18, 38), impulses={12: (8, None)}),
     usmash=A("Eruption", 44, hb(10, 16, 8, -66, 56, 90, 16, 17, 90)),
     dsmash=A("Magma Stomp", 46, hb(12, 13, 84, 28, 30, 36, 16, 14, 35, spike=True), hb(12, 13, -84, 28, 30, 36, 16, 14, 145, spike=True),
@@ -616,6 +621,12 @@ class PhysicsEngine:
         if m.projectile and f == m.projectile['frame']:
             ps = m.projectile
             self.projectiles.append(Projectile(c, ps, c.x + ps['x'] * c.facing, c.y - c.h / 2 + ps['y'], c.facing))
+        if m.slot == 'dashheavy' and m.hitbox_data and f < m.hitbox_data[0]['start']:
+            fx_, fy_ = c.x + c.facing * c.w * 0.6, c.y - c.h * 0.55          # power gathering: the tell to watch for
+            if f % 3 == 0:
+                self.fx.spark(fx_, fy_, c.colors['accent'], 2, 4, 14, 4, direction=math.pi if c.facing > 0 else 0, spread=1.2)
+            if f == 2:
+                self.fx.ring(fx_, fy_, c.colors['accent'], 34, -2, 16)
         if m.effect and m.effect[0] == 'deathray':
             if f < m.effect[1]:
                 self.fx.shake = max(self.fx.shake, 2 + f // 9)
@@ -1392,9 +1403,13 @@ class CharacterController:
             return
         heavy = self._take('heavy')
         if heavy or self._take('attack'):
+            running = (grounded and c.current_state == "RUNNING" and inp.x == c.facing and inp.y == 0
+                       and abs(c.vx) >= c.speed * 0.6 and c.run_frames >= 6)
             if grounded:
                 if c.shield_held and not heavy:
                     slot = 'grab'
+                elif running:                                 # attacks out of a run
+                    slot = 'dashheavy' if heavy else 'dash'
                 elif heavy:
                     slot = 'usmash' if inp.y < 0 else 'dsmash' if inp.y > 0 else 'fsmash'
                 elif inp.y < 0:
@@ -1402,7 +1417,7 @@ class CharacterController:
                 elif inp.y > 0:
                     slot = 'dtilt'
                 elif inp.x:
-                    slot = 'dash' if c.run_frames > 12 else 'ftilt'
+                    slot = 'ftilt'
                 else:
                     slot = 'jab'
             else:
@@ -1504,12 +1519,12 @@ class AIController(CharacterController):
         if slot == 'grab':
             inp.pressed.add('grab')
             return
-        kind = 'special' if 'special' in slot else 'heavy' if 'smash' in slot else 'attack'
+        kind = 'special' if 'special' in slot else 'heavy' if ('smash' in slot or slot == 'dashheavy') else 'attack'
         if slot[0] == 'u':
             inp.y = -1
-        elif slot[0] == 'd' and slot != 'dash':
+        elif slot[0] == 'd' and slot not in ('dash', 'dashheavy'):
             inp.y = 1
-        elif slot in ('ftilt', 'fsmash', 'sspecial', 'dash'):
+        elif slot in ('ftilt', 'fsmash', 'sspecial', 'dash', 'dashheavy'):
             inp.x = toward
         elif slot == 'fair':
             inp.x = c.facing
@@ -1650,8 +1665,8 @@ class AIController(CharacterController):
                     pool.remove('dspecial')
                 if pool and random.random() < 0.45:
                     choice = random.choice(pool)
-                elif adx < 240 and c.run_frames > 12:
-                    choice = 'dash'
+                elif adx < 300 and c.run_frames > 8 and abs(c.vx) >= c.speed * 0.6:
+                    choice = 'dashheavy' if (dmg > 100 and random.random() < 0.6) else 'dash'
         elif adx < reach + 40 and abs(dy) < 120:
             safe = L < c.x < R
             if dy < -50:
@@ -1677,7 +1692,7 @@ class AIController(CharacterController):
 SPR, SPR_CX, SPR_FEET = 340, 170, 262
 HIP_K, SH_K, HEAD_K = 0.43, 0.73, 0.15     # body proportions: hip height, shoulder height, head radius (x fighter height)
 OUTLINE = (22, 14, 34)
-MAUL_SLOTS = {'fsmash', 'usmash', 'dsmash', 'utilt', 'fair', 'bair', 'uair', 'nair'}   # Bronn swings his maul
+MAUL_SLOTS = {'fsmash', 'usmash', 'dsmash', 'utilt', 'fair', 'bair', 'uair', 'nair', 'dashheavy'}   # Bronn swings his maul
 THRUSTS = {'jab', 'fair', 'dash', 'nspecial', 'sspecial', 'grab'}                        # Kai stabs rather than slashes
 
 
@@ -2187,6 +2202,43 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
             line(lerp_color(cc, WHITE, 0.26), (p[0] + nx * off + dx * 0.12, p[1] + ny * off + dy * 0.12),
                  (q[0] + nx * off - dx * 0.12, q[1] + ny * off - dy * 0.12), max(1.0, ww * 0.22))
 
+    def trim(knee, ank, r):
+        """Ends a leg a little above the ankle, so the shoe covers it (no round stub sticking out)."""
+        dx, dy = knee[0] - ank[0], knee[1] - ank[1]
+        d = math.hypot(dx, dy) or 1
+        return (ank[0] + dx / d * r, ank[1] + dy / d * r)
+
+    def shoe(knee, ank, color, L, H, square=False, bare=False):
+        """A foot shaped like a foot: heel behind the ankle, toe in front, sole on the floor. Planted feet lie
+        flat; lifted feet tilt with the shin."""
+        dx, dy = ank[0] - knee[0], ank[1] - knee[1]
+        d = math.hypot(dx, dy) or 1
+        fx, fy = dy / d, -dx / d                              # across the shin, pointing forward
+        if fx < 0.25:
+            fx = 0.25
+        k = clamp(-ank[1] / 9.0, 0.0, 1.0)                    # 0 = standing on the floor
+        fx, fy = (1 - k) + fx * k, fy * k
+        n_ = math.hypot(fx, fy) or 1
+        fx, fy = fx / n_, fy / n_
+        ux, uy = fy, -fx                                      # "up" from the sole
+
+        def Q(a, b):
+            return (ank[0] + fx * a + ux * b, ank[1] + fy * a + uy * b)
+        hb0, toe = -L * 0.28, L * 0.72
+        if square:                                            # an armoured boot
+            pts = [Q(hb0, 0), Q(toe, 0), Q(toe + 1, H * 0.55), Q(toe - 4, H * 0.9), Q(L * 0.12, H * 1.05), Q(hb0, H * 1.15)]
+        elif bare:                                            # a bare foot: low, rounded toes
+            pts = [Q(hb0, 0), Q(toe - 3, 0), Q(toe, H * 0.25), Q(toe - 2, H * 0.6), Q(L * 0.25, H * 0.8),
+                   Q(hb0 + 2, H * 1.1), Q(hb0 - 1, H * 0.45)]
+        else:                                                 # a soft boot
+            pts = [Q(hb0, 0), Q(toe - 2, 0), Q(toe + 1, H * 0.3), Q(toe - 3, H * 0.72), Q(L * 0.18, H * 0.95),
+                   Q(hb0 + 1, H * 1.2), Q(hb0 - 1, H * 0.5)]
+        opoly(color, pts)
+        if not bare:
+            line(lerp_color(color, INK, 0.5), Q(hb0 + 1, 1.0), Q(toe - 2, 1.0), 2.2)          # sole
+        line(lerp_color(color, WHITE, 0.3), Q(L * 0.02, H * 0.85), Q(toe - 5, H * 0.55), 1.2)   # shine
+        return Q
+
     def bands(a, b, color, ks, half, wd=1.6):                # cloth wraps / plate seams across a limb
         d = math.hypot(b[0] - a[0], b[1] - a[1]) or 1
         nx, ny = -(b[1] - a[1]) / d, (b[0] - a[0]) / d
@@ -2258,7 +2310,13 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         neck = (sh[0] - 3, sh[1] + 1)
         limb(mid, sb, eb, hb_, aw + 1, lerp_color(wrapc, INK, 0.2), aw)                      # far arm
         bands(eb, hb_, wrap_lo, (0.3, 0.55, 0.8), aw / 2)
-        limb(lerp_color(pants, INK, 0.25), hpb, kb, fb, lw + 4, lerp_color(pants, INK, 0.25), lw + 1)   # far leg
+        def kai_foot(knee, ank):
+            bands(knee, ank, wrapc, (0.5, 0.64, 0.78), (lw + 1) / 2 + 0.5, 2.2)               # shin wraps
+            Q = shoe(knee, ank, bootc, lw + 11, 8.5)
+            line(wrapc, Q(-1.5, 6.5), Q(4.5, 6.0), 1.8)                                      # strap over the instep
+
+        limb(lerp_color(pants, INK, 0.25), hpb, kb, trim(kb, fb, 5), lw + 4, lerp_color(pants, INK, 0.25), lw + 1)   # far leg
+        kai_foot(kb, fb)
         cloth_strip('scarf2', (neck[0], neck[1] + 3), 8, 8, lerp_color(acc, INK, 0.25), 11, 6, 0.2, 0.5, 0.6)
         tail = cloth_strip('scarf1', neck, 9, 8, acc, 13, 7, 0.16, 0.55, 0.6)
         poly(INK, [tail[-1], (tail[-1][0] - 5, tail[-1][1] - 3), (tail[-1][0] - 4, tail[-1][1] + 3)])    # torn end
@@ -2269,17 +2327,14 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         opoly(main, [(hip[0] - hw / 2 - 2, hip[1] + 1), (hip[0] + hw / 2 + 2, hip[1] + 1), (hip[0] + hw / 2 + 4, hip[1] + 15),
                      (hip[0] + hw * 0.28, hip[1] + 9), (hip[0] + 1, hip[1] + 18), (hip[0] - hw * 0.25, hip[1] + 10),
                      (hip[0] - hw / 2 - 4, hip[1] + 16)])                                    # tattered tunic skirt
-        limb(pants, hpf, kf, ff, lw + 4, pants_hi, lw + 1)                                   # near leg
+        limb(pants, hpf, kf, trim(kf, ff, 5), lw + 4, pants_hi, lw + 1)                     # near leg
         opoly(lerp_color(main, WHITE, 0.08), [(hip[0] - 1, hip[1] + 1), (hip[0] + hw / 2 + 2, hip[1] + 1),
                                               (hip[0] + hw / 2 + 4, hip[1] + 15), (hip[0] + hw * 0.22, hip[1] + 10)])
         line(lerp_color(acc, INK, 0.25), (hip[0] - hw / 2 - 1, hip[1]), (hip[0] + hw / 2 + 1, hip[1]), 5.5)   # rope belt
         line(acc, (hip[0] - hw / 2, hip[1] - 1), (hip[0] + hw / 2, hip[1] - 1), 2.2)
         oC((176, 182, 198), (hip[0] + hw * 0.25, hip[1] + 4), 2.6, hl=False)                 # belt ring
         C(INK, (hip[0] + hw * 0.25, hip[1] + 4), 1.1)
-        for knee, foot in ((kb, fb), (kf, ff)):                                              # shin wraps and shoes
-            bands(knee, foot, wrapc, (0.55, 0.7, 0.85), (lw + 1) / 2 + 0.5, 2.2)
-            ooval(bootc, (foot[0] + 3, foot[1] - 4), lw + 9, lw + 1)
-            oval(lerp_color(bootc, WHITE, 0.25), (foot[0] + 5, foot[1] - 6), lw + 1, 3)
+        kai_foot(kf, ff)
         ooval(acc, (sh[0], sh[1] + 1), tw + 9, 12)                                           # scarf wound round the neck
         oval(lerp_color(acc, INK, 0.28), (sh[0] - 3, sh[1] + 4), tw + 2, 4)
         oval(lerp_color(acc, WHITE, 0.3), (sh[0] + 4, sh[1] - 2), tw * 0.5, 2.5)
@@ -2399,7 +2454,8 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
             shield(hb_, mid)
         else:
             maul(hb_, -1.72)                                                                  # hammer raised behind his head
-        limb(plate_lo, hpb, kb, fb, lw + 4, plate_lo, lw + 3)                                # far leg
+        limb(plate_lo, hpb, kb, trim(kb, fb, 6), lw + 4, plate_lo, lw + 3)                  # far leg
+        shoe(kb, fb, lerp_color(plate_lo, INK, 0.15), lw + 16, 11, square=True)
         oC(plate_lo, (sh[0] - w * 0.3, sh[1] + 3), w * 0.2, hl=False)                        # rear pauldron
         tw2, hw2 = w * 0.82, w * 0.56
         torso(main, tw2, hw2, 4, mid)
@@ -2421,12 +2477,11 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         obox(steel, (hip[0] + 2, hip[1] + 1), 8, 8, 1)
         opoly(mid, [(hip[0] - 2, hip[1] + 5), (hip[0] + hw2 / 2 + 3, hip[1] + 5),
                     (hip[0] + hw2 / 2 - 1, hip[1] + 17), (hip[0] + 2, hip[1] + 19)])         # tasset
-        limb(main, hpf, kf, ff, lw + 4, mid, lw + 3)                                         # near leg
+        limb(main, hpf, kf, trim(kf, ff, 6), lw + 4, mid, lw + 3)                           # near leg
         bands(kf, ff, INK, (0.5,), (lw + 3) / 2, 1.2)
         oC(main, kf, lw / 2 + 3.5)                                                           # knee cop
-        for foot in (fb, ff):
-            obox(mid, (foot[0] + 4, foot[1] - 6), lw + 15, 13, 5)
-            line(plate_hi, (foot[0] - 3, foot[1] - 10), (foot[0] + 10, foot[1] - 10), 1.4)
+        Q = shoe(kf, ff, mid, lw + 16, 11, square=True)
+        line(INK, Q(lw * 0.45, 0.5), Q(lw * 0.45, 10.0), 1.1)                               # toe plate seam
         obox(plate_lo, (head[0] - hr * 0.3, head[1] + hr * 1.0), hr * 1.5, 7, 3)             # gorget
         hw_, hh_ = hr * 2 + 13, hr * 2 + 11
         obox(skin, head, hw_, hh_, 6)                                                        # bucket great-helm
@@ -2579,14 +2634,14 @@ def render_fighter_surface(spec, col, P, facing, t, key='idle', vel=(0.0, 0.0), 
         wrap_lo = lerp_color(wrapc, INK, 0.35)
 
         def leg2(a, j, b, color):
-            limb(color, a, j, b, lw + 4, color, lw + 1)
+            limb(color, a, j, trim(j, b, 5), lw + 4, color, lw + 1)
             sx_, sy_ = b[0] - j[0], b[1] - j[1]
             opoly(color, [(j[0] + sx_ * 0.5 - lw / 2 - 2, j[1] + sy_ * 0.5), (j[0] + sx_ * 0.5 + lw / 2 + 2, j[1] + sy_ * 0.5),
                           (j[0] + sx_ * 0.7 + 3, j[1] + sy_ * 0.7), (j[0] + sx_ * 0.6, j[1] + sy_ * 0.6),
                           (j[0] + sx_ * 0.74 - 3, j[1] + sy_ * 0.74)], 0.9)                   # torn trouser cuff
-            bands(j, b, wrapc, (0.8, 0.92), lw / 2 + 0.5, 2.2)
-            ooval(skin, (b[0] + 3, b[1] - 3), 12, 7)
-            line(wrapc, (b[0] - 1, b[1] - 5), (b[0] + 6, b[1] - 4), 2)
+            bands(j, b, wrapc, (0.74, 0.86), lw / 2 + 0.5, 2.2)
+            Q = shoe(j, b, skin, lw + 9, 6.5, bare=True)
+            line(wrapc, Q(-2.0, 5.5), Q(5.0, 4.5), 2.0)                                       # wrap across the foot
             if hot:                                                                           # fire licks round her feet
                 flame_strand(chain('foot%d' % (a is hpf), (b[0] - 4, b[1] - 1), 4, 5, -0.5, 0.78, 0.9), 9, fire, 5.0)
 
