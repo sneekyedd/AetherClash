@@ -320,61 +320,79 @@ void scaleInto(const Surface& s, Surface& d) {
     }
 }
 
-// one dimension of a smooth resample: box filter when shrinking, linear when stretching
-static void resampleLine(const float* in, int n, int stride, float* out, int m, int ostride) {
-    if (m < n) {
-        double ratio = double(n) / m;
-        for (int i = 0; i < m; ++i) {
-            double a = i * ratio, b = a + ratio;
-            int ia = int(a);
-            float acc[4] = {0, 0, 0, 0};
-            double total = 0;
-            for (int k = ia; k < n && k < b; ++k) {
+// Smooth resampling: a box filter when shrinking, linear when stretching (separable, with precomputed weights).
+namespace {
+struct Tap { int k; float w; };
+std::vector<std::vector<Tap>> resampleTaps(int n, int m) {
+    std::vector<std::vector<Tap>> taps(m);
+    double ratio = double(n) / m;
+    for (int i = 0; i < m; ++i) {
+        if (m < n) {
+            double a = i * ratio, b = a + ratio, total = 0;
+            for (int k = int(a); k < n && k < b; ++k) {
                 double wgt = std::min<double>(k + 1, b) - std::max<double>(k, a);
-                if (wgt <= 0) continue;
-                for (int c = 0; c < 4; ++c) acc[c] += float(in[k * stride + c] * wgt);
-                total += wgt;
+                if (wgt > 0) { taps[i].push_back({k, float(wgt)}); total += wgt; }
             }
-            for (int c = 0; c < 4; ++c) out[i * ostride + c] = float(acc[c] / (total > 0 ? total : 1));
-        }
-    } else {
-        double ratio = double(n) / m;
-        for (int i = 0; i < m; ++i) {
+            for (auto& t : taps[i]) t.w = float(t.w / (total > 0 ? total : 1));
+        } else {
             double p = (i + 0.5) * ratio - 0.5;
             int i0 = int(std::floor(p));
             double t = p - i0;
             int a = std::clamp(i0, 0, n - 1), b = std::clamp(i0 + 1, 0, n - 1);
-            for (int c = 0; c < 4; ++c) out[i * ostride + c] = float(in[a * stride + c] * (1 - t) + in[b * stride + c] * t);
+            taps[i].push_back({a, float(1 - t)});
+            taps[i].push_back({b, float(t)});
         }
     }
+    return taps;
 }
+}  // namespace
 
 void smoothscaleInto(const Surface& s, const Rect& areaIn, Surface& d) {
     Rect area = areaIn.clip(s.rect());
     if (area.empty() || d.w <= 0 || d.h <= 0) return;
     int sw = area.w, sh = area.h, dw = d.w, dh = d.h;
-    std::vector<float> src(size_t(sw) * sh * 4), mid(size_t(dw) * sh * 4), dst(size_t(dw) * dh * 4);
-    for (int y = 0; y < sh; ++y)
-        for (int x = 0; x < sw; ++x) {
-            uint32_t p = s.get(area.x + x, area.y + y);
-            float* q = &src[(size_t(y) * sw + x) * 4];
-            q[0] = R_(p); q[1] = G_(p); q[2] = B_(p); q[3] = s.hasAlpha ? A_(p) : 255;
+    bool sa = s.hasAlpha, da = d.hasAlpha;
+    if (sw == dw * 2 && sh == dh * 2) {                     // the common case: exactly half size
+        for (int y = 0; y < dh; ++y) {
+            const uint32_t* r0 = &s.px[size_t(area.y + 2 * y) * s.w + area.x];
+            const uint32_t* r1 = r0 + s.w;
+            uint32_t* out = &d.px[size_t(y) * d.w];
+            for (int x = 0; x < dw; ++x) {
+                uint32_t a = r0[2 * x], b = r0[2 * x + 1], c = r1[2 * x], e = r1[2 * x + 1];
+                int R = (R_(a) + R_(b) + R_(c) + R_(e) + 2) >> 2, G = (G_(a) + G_(b) + G_(c) + G_(e) + 2) >> 2;
+                int B = (B_(a) + B_(b) + B_(c) + B_(e) + 2) >> 2;
+                int A = sa ? (A_(a) + A_(b) + A_(c) + A_(e) + 2) >> 2 : 255;
+                out[x] = P_(R, G, B, da ? A : 255);
+            }
         }
-    for (int y = 0; y < sh; ++y) resampleLine(&src[size_t(y) * sw * 4], sw, 4, &mid[size_t(y) * dw * 4], dw, 4);
-    std::vector<float> colIn(size_t(sh) * 4), colOut(size_t(dh) * 4);
-    for (int x = 0; x < dw; ++x) {
-        for (int y = 0; y < sh; ++y)
-            for (int c = 0; c < 4; ++c) colIn[size_t(y) * 4 + c] = mid[(size_t(y) * dw + x) * 4 + c];
-        resampleLine(colIn.data(), sh, 4, colOut.data(), dh, 4);
-        for (int y = 0; y < dh; ++y)
-            for (int c = 0; c < 4; ++c) dst[(size_t(y) * dw + x) * 4 + c] = colOut[size_t(y) * 4 + c];
+        return;
     }
-    for (int y = 0; y < dh; ++y)
+    auto tx = resampleTaps(sw, dw), ty = resampleTaps(sh, dh);
+    std::vector<float> mid(size_t(dw) * sh * 4);
+    for (int y = 0; y < sh; ++y) {
+        const uint32_t* row = &s.px[size_t(area.y + y) * s.w + area.x];
+        float* o = &mid[size_t(y) * dw * 4];
         for (int x = 0; x < dw; ++x) {
-            float* q = &dst[(size_t(y) * dw + x) * 4];
-            auto cl = [](float v) { return std::clamp(int(v + 0.5f), 0, 255); };
-            d.put(x, y, P_(cl(q[0]), cl(q[1]), cl(q[2]), d.hasAlpha ? cl(q[3]) : 255));
+            float r = 0, g = 0, b = 0, a = 0;
+            for (const Tap& t : tx[x]) {
+                uint32_t p = row[t.k];
+                r += R_(p) * t.w; g += G_(p) * t.w; b += B_(p) * t.w; a += (sa ? A_(p) : 255) * t.w;
+            }
+            o[x * 4] = r; o[x * 4 + 1] = g; o[x * 4 + 2] = b; o[x * 4 + 3] = a;
         }
+    }
+    std::vector<float> acc(size_t(dw) * 4);
+    auto cl = [](float v) { return std::clamp(int(v + 0.5f), 0, 255); };
+    for (int y = 0; y < dh; ++y) {
+        std::fill(acc.begin(), acc.end(), 0.0f);
+        for (const Tap& t : ty[y]) {
+            const float* m = &mid[size_t(t.k) * dw * 4];
+            for (int i = 0; i < dw * 4; ++i) acc[i] += m[i] * t.w;
+        }
+        uint32_t* out = &d.px[size_t(y) * d.w];
+        for (int x = 0; x < dw; ++x)
+            out[x] = P_(cl(acc[x * 4]), cl(acc[x * 4 + 1]), cl(acc[x * 4 + 2]), da ? cl(acc[x * 4 + 3]) : 255);
+    }
 }
 
 SurfacePtr smoothscale(const Surface& s, int w, int h) {
@@ -444,8 +462,40 @@ SurfacePtr flipX(const Surface& s) {
 // ------------------------------------------------------------------ outlines and glows
 void outlineSilhouette(Surface& s, int threshold, Color c, int width) {
     int W = s.w, H = s.h;
-    std::vector<uint8_t> m(size_t(W) * H);
-    for (size_t i = 0; i < m.size(); ++i) m[i] = A_(s.px[i]) >= threshold;
+    // work only inside the bounding box of the silhouette (plus a one pixel border, which is always "outside")
+    int bx0 = W, by0 = H, bx1 = -1, by1 = -1;
+    for (int y = 0; y < H; ++y) {
+        const uint32_t* row = &s.px[size_t(y) * W];
+        for (int x = 0; x < W; ++x)
+            if (A_(row[x]) >= threshold) {
+                if (x < bx0) bx0 = x;
+                if (x > bx1) bx1 = x;
+                if (y < by0) by0 = y;
+                by1 = y;
+            }
+    }
+    if (bx1 < 0) return;
+    int ox = bx0 - 1, oy = by0 - 1, RW = bx1 - bx0 + 3, RH = by1 - by0 + 3;
+    std::vector<uint8_t> m(size_t(RW) * RH, 0);              // 1 = solid, 2 = empty space reachable from outside
+    for (int y = 1; y < RH - 1; ++y) {
+        const uint32_t* row = &s.px[size_t(oy + y) * W + ox];
+        uint8_t* mr = &m[size_t(y) * RW];
+        for (int x = 1; x < RW - 1; ++x) mr[x] = A_(row[x]) >= threshold;
+    }
+    std::vector<int> stack;
+    stack.reserve(size_t(RW + RH) * 4);
+    auto seed = [&](int i) { if (m[i] == 0) { m[i] = 2; stack.push_back(i); } };
+    for (int x = 0; x < RW; ++x) { seed(x); seed((RH - 1) * RW + x); }
+    for (int y = 0; y < RH; ++y) { seed(y * RW); seed(y * RW + RW - 1); }
+    while (!stack.empty()) {
+        int i = stack.back();
+        stack.pop_back();
+        int x = i % RW;
+        if (x > 0) seed(i - 1);
+        if (x < RW - 1) seed(i + 1);
+        if (i >= RW) seed(i - RW);
+        if (i < (RH - 1) * RW) seed(i + RW);
+    }
     uint32_t col = pack(c);
     double r = width / 2.0;
     int ri = int(std::ceil(r));
@@ -453,36 +503,19 @@ void outlineSilhouette(Surface& s, int threshold, Color c, int width) {
     for (int dy = -ri; dy <= ri; ++dy)
         for (int dx = -ri; dx <= ri; ++dx)
             if (dx * dx + dy * dy <= r * r + 0.25) disk.push_back({dx, dy});
-    // only the OUTER edge is outlined (like pygame's mask outline): find the empty space connected to the border
-    std::vector<uint8_t> outside(size_t(W) * H, 0);
-    std::vector<int> stack;
-    auto seed = [&](int x, int y) {
-        size_t i = size_t(y) * W + x;
-        if (!m[i] && !outside[i]) { outside[i] = 1; stack.push_back(int(i)); }
-    };
-    for (int x = 0; x < W; ++x) { seed(x, 0); seed(x, H - 1); }
-    for (int y = 0; y < H; ++y) { seed(0, y); seed(W - 1, y); }
-    while (!stack.empty()) {
-        int i = stack.back();
-        stack.pop_back();
-        int x = i % W, y = i / W;
-        if (x > 0) seed(x - 1, y);
-        if (x < W - 1) seed(x + 1, y);
-        if (y > 0) seed(x, y - 1);
-        if (y < H - 1) seed(x, y + 1);
-    }
-    auto out = [&](int x, int y) { return x < 0 || y < 0 || x >= W || y >= H || outside[size_t(y) * W + x]; };
-    std::vector<std::pair<int, int>> edge;
-    for (int y = 0; y < H; ++y)
-        for (int x = 0; x < W; ++x) {
-            if (!m[size_t(y) * W + x]) continue;
-            if (out(x - 1, y) || out(x + 1, y) || out(x, y - 1) || out(x, y + 1)) edge.push_back({x, y});
+    std::vector<int> edge;
+    for (int y = 1; y < RH - 1; ++y)
+        for (int x = 1; x < RW - 1; ++x) {
+            int i = y * RW + x;
+            if (m[i] == 1 && (m[i - 1] == 2 || m[i + 1] == 2 || m[i - RW] == 2 || m[i + RW] == 2)) edge.push_back(i);
         }
-    for (auto [x, y] : edge)
+    for (int i : edge) {
+        int x = ox + i % RW, y = oy + i / RW;
         for (auto [dx, dy] : disk) {
             int xx = x + dx, yy = y + dy;
-            if (xx >= 0 && yy >= 0 && xx < W && yy < H) s.put(xx, yy, col);
+            if (xx >= 0 && yy >= 0 && xx < W && yy < H) s.px[size_t(yy) * W + xx] = col;
         }
+    }
 }
 
 int countOpaque(const Surface& s, int threshold) {
