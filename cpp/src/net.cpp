@@ -503,7 +503,7 @@ static std::vector<int> versionNumbers(std::string tag) {
     return out;
 }
 
-Updater::Updater(std::vector<std::string> srv) : exe(exePath()) {
+Updater::Updater(std::vector<std::string> srv, bool allowed) : exe(exePath()) {
     for (auto& s : srv) if (!trim(s).empty()) servers.push_back(trim(s));
     const char* env = std::getenv("AETHER_UPDATE_URL");
 #ifdef _WIN32
@@ -511,6 +511,7 @@ Updater::Updater(std::vector<std::string> srv) : exe(exePath()) {
 #else
     enabled = !exe.empty() && env && *env && std::getenv("AETHER_UPDATE_TEST");      // only for testing off Windows
 #endif
+    enabled = enabled && allowed;
     if (!enabled) return;
     removeFile(exe + ".old");
     removeFile(exe + ".new");

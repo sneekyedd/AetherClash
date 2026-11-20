@@ -1,20 +1,48 @@
 # Aether Clash
 
-A 2D platform fighter prototype in a single Python file, drawn entirely with Pygame shapes (no image files needed).
+A 2D platform fighter written in C++ (with SDL2 for the window, keyboard and gamepads). Every fighter, stage and
+effect is drawn by code; there are no image files to install.
 
 Knock your rival off the screen. Every hit adds to their damage **%**, and the higher it is, the further they fly. Each fighter has 3 lives.
 
-## Run it
+## Play it
+
+Download `AetherClash.exe` from the newest release on GitHub and double-click it. Nothing else is needed.
+
+## Build it yourself
+
+You need CMake, a C++17 compiler and SDL2 (on Ubuntu: `sudo apt install cmake g++ libsdl2-dev`).
 
 ```bash
-pip install pygame
+cmake -S cpp -B build
 ```
 
 ```bash
-python aether_clash.py
+cmake --build build -j
 ```
 
-`python aether_clash.py --demo` watches two CPUs fight. `python aether_clash.py --selftest` runs a windowless test of every fighter and stage.
+```bash
+./build/AetherClash
+```
+
+- `./build/AetherClash --demo` watches two CPUs fight.
+- `./build/AetherClash --selftest` runs a windowless test of every fighter and stage, the secret ending and every screen.
+- `cpp/cmake/mingw-w64.cmake` cross-compiles the Windows .exe from Linux; `.github/workflows/release.yml` shows the exact steps.
+
+The code, in `cpp/src/`:
+
+| File | What it does |
+| --- | --- |
+| `gfx.*` | the drawing library: shapes, blending, scaling, rotation, outlines, text, PNG |
+| `core.h`, `roster.cpp` | rules, tuning values, the four fighters' moves and the three stages |
+| `sim.cpp` | physics, hit detection, knockback, the combat state machine, effects |
+| `control.cpp` | buttons to actions, input buffering, and the CPU player |
+| `art_*.cpp` | skeleton animation, cloth physics, the fighters' drawings, attack effects, scenery |
+| `game.cpp`, `screens.cpp` | the main loop, menus, HUD, profiles, settings and online lockstep |
+| `net.cpp` | the lobby connection, HTTP downloads and the auto-updater |
+| `annihilation.cpp` | the Death Ray ending |
+
+The original Python version is kept in `legacy/` for reference.
 
 ## Controls
 
@@ -61,7 +89,8 @@ frames ahead ("lockstep"). The server does no game logic, so it needs almost no 
 
 ## Hosting the lobby server
 
-The server is one small Python file, `aether_server.py`. It needs **one TCP port (7777)** open to the internet.
+The server is one small Python file, `aether_server.py` (it stays in Python: it runs on the server, not on
+players' computers, and the C++ game talks to it exactly as before). It needs **one TCP port (7777)** open to the internet.
 The same port also hands players the latest version of the game (see Automatic updates).
 
 **With Docker** (from a copy of this repository on the server):
@@ -146,11 +175,4 @@ circles), and what you see on screen is exactly that circle, in the fighter's ow
 outline the real hitboxes in red.
 
 The sprite images cut from the supplied artwork sheets are kept in `art/custom_sprites/` but are not used for now.
-To switch a fighter back to them, move its folder (for example `art/custom_sprites/kai`) into `assets/`.
-
-Any fighter folder in `assets/` replaces that fighter's code-drawn art:
-
-- A still pose is `assets/kai/idle.png`; an animation is `run_1.png`, `run_2.png`, ... played in number order.
-- Draw the fighter facing right on a transparent background.
-- `assets/kai/sprite.json` holds the size and alignment: `scale`, `fps`, `anchors` and `zoom`.
-- Stage backgrounds: `assets/bg_atoll.png`, `bg_loom.png`, `bg_crucible.png` (2400x1400).
+(The C++ game does not load fighter images yet; the Python version in `legacy/` still can.)

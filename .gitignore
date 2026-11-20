@@ -9,3 +9,6 @@ server.txt
 server/updates/
 server/players.txt
 aether_clash_settings.json
+build*/
+selftest_profiles.json
+nettest_profiles.json

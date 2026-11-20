@@ -98,7 +98,8 @@ enum class Scene { TITLE, UPDATE, MENU, PROFILES, ONLINE, FIGHT, RESULT, CINEMAT
 
 class Game {
 public:
-    explicit Game(bool headless = false, bool demo = false, const std::string& profilePath = "");
+    explicit Game(bool headless = false, bool demo = false, const std::string& profilePath = "", bool checkUpdates = true);
+    long maxLoops = 0;                       // (testing) close by itself after this many frames
     ~Game();
     void run();
     void step();

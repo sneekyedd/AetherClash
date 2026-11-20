@@ -2,12 +2,17 @@ name: Build and release Windows .exe
 
 # Runs on every push to the repository's default branch (and can be started by hand
 # from the Actions tab). Each run publishes a new release with AetherClash.exe attached.
+#
+# The game is C++ (in cpp/). It is built and tested on Linux, cross-compiled into one Windows .exe that needs
+# nothing else installed, then that exact .exe is tested on a real Windows machine before it is published
+# (players' games update themselves to every release, so a broken build must never get out).
 on:
   push:
     paths-ignore:
       - '**.md'
       - 'server/**'
       - 'aether_server.py'
+      - 'legacy/**'
   workflow_dispatch:
 
 permissions:
@@ -17,49 +22,89 @@ concurrency:
   group: release
   cancel-in-progress: false
 
+env:
+  SDL_VERSION: 2.30.9
+
 jobs:
-  release:
+  build:
     if: github.event_name == 'workflow_dispatch' || github.ref_name == github.event.repository.default_branch
-    runs-on: windows-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+      - name: Install compilers and SDL2
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake g++ libsdl2-dev mingw-w64
+          curl -sSLf -o sdl.tar.gz "https://github.com/libsdl-org/SDL/releases/download/release-${SDL_VERSION}/SDL2-devel-${SDL_VERSION}-mingw.tar.gz"
+          tar xzf sdl.tar.gz
 
-      - name: Install dependencies
-        run: pip install pygame pyinstaller pillow numpy
-
-      - name: Smoke test
-        run: python aether_clash.py --selftest
-        env:
-          SDL_VIDEODRIVER: dummy
-          SDL_AUDIODRIVER: dummy
+      - name: Build for Linux and run the smoke tests
+        run: |
+          cmake -S cpp -B build-linux -DCMAKE_BUILD_TYPE=Release
+          cmake --build build-linux -j 4
+          ./build-linux/AetherClash --selftest
+          SDL_VIDEODRIVER=dummy ./build-linux/AetherClash --smoke 300
 
       - name: Stamp the version
-        shell: bash
         run: |
           echo "v0.1.${{ github.run_number }}" > version.txt
           echo "${{ vars.AETHER_SERVER }}" > server.txt
 
-      - name: Draw the game icon
-        run: python aether_clash.py --make-icon icon.png
-        env:
-          SDL_VIDEODRIVER: dummy
-          SDL_AUDIODRIVER: dummy
-
       - name: Build AetherClash.exe
-        run: pyinstaller --onefile --windowed --name AetherClash --icon icon.png --add-data "assets;assets" --add-data "version.txt;." --add-data "server.txt;." aether_clash.py
+        run: |
+          cmake -S cpp -B build-win -DCMAKE_BUILD_TYPE=Release -DAETHER_STATIC=ON \
+                -DCMAKE_TOOLCHAIN_FILE=$PWD/cpp/cmake/mingw-w64.cmake \
+                -DCMAKE_PREFIX_PATH=$PWD/SDL2-${SDL_VERSION}/x86_64-w64-mingw32
+          cmake --build build-win -j 4
+          x86_64-w64-mingw32-strip build-win/AetherClash.exe
+          ls -la build-win/AetherClash.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AetherClash
+          path: build-win/AetherClash.exe
+
+  test-windows:
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AetherClash
+
+      - name: Self-test on Windows
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\AetherClash.exe -ArgumentList '--selftest' -Wait -PassThru -NoNewWindow `
+               -RedirectStandardOutput selftest.txt -RedirectStandardError selftest_err.txt
+          Get-Content selftest.txt
+          if ($p.ExitCode -ne 0 -or -not (Select-String -Path selftest.txt -Pattern 'SELFTEST OK' -Quiet)) { exit 1 }
+
+      - name: Open the game window on Windows
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath .\AetherClash.exe -ArgumentList '--smoke','300' -Wait -PassThru -NoNewWindow `
+               -RedirectStandardOutput smoke.txt -RedirectStandardError smoke_err.txt
+          Get-Content smoke.txt
+          if ($p.ExitCode -ne 0 -or -not (Select-String -Path smoke.txt -Pattern 'WINDOW OK' -Quiet)) { exit 1 }
+
+  publish:
+    needs: test-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: AetherClash
 
       - name: Publish release
-        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="v0.1.${{ github.run_number }}"
-          gh release create "$TAG" dist/AetherClash.exe \
+          gh release create "$TAG" AetherClash.exe \
+            --repo "${{ github.repository }}" \
             --target "${{ github.sha }}" \
             --title "Aether Clash $TAG" \
-            --notes "Automatic build of commit ${{ github.sha }}. Download AetherClash.exe below and double-click it to play (Windows). No Python needed." \
+            --notes "Automatic build of commit ${{ github.sha }}. Download AetherClash.exe below and double-click it to play (Windows). Nothing else to install." \
             --latest

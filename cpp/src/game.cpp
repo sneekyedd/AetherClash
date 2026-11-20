@@ -158,7 +158,7 @@ bool ProfileStore::save() {
 }
 
 // ===================================================================== setup
-Game::Game(bool headless_, bool demo, const std::string& profilePath) : headless(headless_) {
+Game::Game(bool headless_, bool demo, const std::string& profilePath, bool checkUpdates) : headless(headless_) {
     buildRoster();
     fontData.assign(ASSET_FONT, ASSET_FONT + ASSET_FONT_LEN);
     loadSettings();
@@ -187,7 +187,8 @@ Game::Game(bool headless_, bool demo, const std::string& profilePath) : headless
     if (demo) { p2Mode = 2; p1Cpu = true; }
     profiles = std::make_unique<ProfileStore>(profilePath);
     on.text = loadAddress();
-    updater = new Updater({on.text, defaultServer()});      // lives for the whole run
+    updater = new Updater(checkUpdates && !headless ? std::vector<std::string>{on.text, defaultServer()}
+                                                    : std::vector<std::string>{}, checkUpdates && !headless);   // lives for the whole run
     if (updater->enabled && !demo) scene = Scene::UPDATE;  // opening the game always checks for an update first
 }
 
@@ -336,7 +337,9 @@ void Game::run() {
     const double step_ = 1.0 / FPS;
     double acc = 0.0;
     auto last = clock::now();
+    long loops = 0;
     while (running) {
+        if (maxLoops && ++loops > maxLoops) break;
         auto now = clock::now();
         double dt = std::min(std::chrono::duration<double>(now - last).count(), 0.1);
         last = now;

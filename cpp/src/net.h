@@ -88,7 +88,7 @@ private:
 class Updater {
 public:
     enum State { OFF, CHECKING, DOWNLOADING, READY, DONE, SKIPPED };
-    explicit Updater(std::vector<std::string> servers);     // (create with new and keep for the whole run)
+    explicit Updater(std::vector<std::string> servers, bool allowed = true);   // (create with new; keep for the whole run)
     bool enabled = false;
     std::atomic<int> state{OFF};
     std::atomic<double> progress{0.0};
