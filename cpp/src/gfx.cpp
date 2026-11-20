@@ -2,6 +2,8 @@
 
 #include <unordered_map>
 #include <mutex>
+#include <thread>
+#include <functional>
 
 #define STB_IMAGE_IMPLEMENTATION
 #define STBI_ONLY_PNG
@@ -130,13 +132,29 @@ void Surface::blit(const Surface& src, double fx, double fy, const Rect& areaIn,
             std::copy(srow, srow + dst.w, drow);
             continue;
         }
+        if (mode == Blend::Normal) {                      // the common case, kept tight
+            const bool sAlpha = src.hasAlpha, dAlpha = hasAlpha;
+            for (int i = 0; i < dst.w; ++i) {
+                uint32_t s = srow[i];
+                int a = sAlpha ? int(s >> 24) : 255;
+                if (sa_mul < 255) a = (a * sa_mul) / 255;
+                if (a == 0) continue;
+                if (a >= 255) { drow[i] = s | 0xFF000000u; continue; }
+                uint32_t d = drow[i];
+                int da = int(d >> 24);
+                if (dAlpha && da == 0) { drow[i] = (s & 0xFFFFFFu) | (uint32_t(a) << 24); continue; }
+                int sr = R_(s), sg = G_(s), sb = B_(s), dr = R_(d), dg = G_(d), db = B_(d);
+                dr += ((sr - dr) * a + sr) >> 8;
+                dg += ((sg - dg) * a + sg) >> 8;
+                db += ((sb - db) * a + sb) >> 8;
+                da = dAlpha ? a + da - (a * da) / 255 : 255;
+                drow[i] = P_(dr, dg, db, da);
+            }
+            continue;
+        }
         for (int i = 0; i < dst.w; ++i) {
             uint32_t s = srow[i];
             int a = src.hasAlpha ? A_(s) : 255;
-            if (mode == Blend::Normal) {
-                if (sa_mul < 255) a = (a * sa_mul) / 255;
-                if (a == 0) continue;
-            }
             drow[i] = blendPixel(drow[i], R_(s), G_(s), B_(s), a, mode, hasAlpha);
         }
     }
@@ -312,11 +330,20 @@ SurfacePtr scale(const Surface& s, int w, int h) {
 }
 
 void scaleInto(const Surface& s, Surface& d) {
+    std::vector<int> xs(size_t(d.w));
+    for (int x = 0; x < d.w; ++x) xs[size_t(x)] = std::min(s.w - 1, int((long long)x * s.w / d.w));
+    const uint32_t fix = d.hasAlpha ? 0u : 0xFF000000u;
+    int prevSy = -1;
     for (int y = 0; y < d.h; ++y) {
         int sy = std::min(s.h - 1, int((long long)y * s.h / d.h));
-        const uint32_t* srow = &s.px[size_t(sy) * s.w];
         uint32_t* drow = &d.px[size_t(y) * d.w];
-        for (int x = 0; x < d.w; ++x) drow[x] = srow[std::min(s.w - 1, int((long long)x * s.w / d.w))];
+        if (sy == prevSy) {                               // same source row as the line above: copy it
+            std::copy(drow - d.w, drow, drow);
+            continue;
+        }
+        prevSy = sy;
+        const uint32_t* srow = &s.px[size_t(sy) * s.w];
+        for (int x = 0; x < d.w; ++x) drow[x] = srow[xs[size_t(x)]] | fix;
     }
 }
 
@@ -369,7 +396,23 @@ void smoothscaleInto(const Surface& s, const Rect& areaIn, Surface& d) {
     }
     auto tx = resampleTaps(sw, dw), ty = resampleTaps(sh, dh);
     std::vector<float> mid(size_t(dw) * sh * 4);
-    for (int y = 0; y < sh; ++y) {
+    // big images (the camera view every frame) are split across the CPU cores
+    auto parallelRows = [](int n, bool big, const std::function<void(int, int)>& fn) {
+        unsigned hw = std::thread::hardware_concurrency();
+        int parts = big ? int(std::clamp(hw, 1u, 8u)) : 1;
+        if (parts <= 1) { fn(0, n); return; }
+        std::vector<std::thread> th;
+        int chunk = (n + parts - 1) / parts;
+        for (int p = 1; p < parts; ++p) {
+            int lo = p * chunk, hi = std::min(n, lo + chunk);
+            if (lo < hi) th.emplace_back(fn, lo, hi);
+        }
+        fn(0, std::min(n, chunk));
+        for (auto& t : th) t.join();
+    };
+    bool big = (long long)sw * sh > 300000;
+    parallelRows(sh, big, [&](int lo, int hi) {
+    for (int y = lo; y < hi; ++y) {
         const uint32_t* row = &s.px[size_t(area.y + y) * s.w + area.x];
         float* o = &mid[size_t(y) * dw * 4];
         for (int x = 0; x < dw; ++x) {
@@ -381,9 +424,11 @@ void smoothscaleInto(const Surface& s, const Rect& areaIn, Surface& d) {
             o[x * 4] = r; o[x * 4 + 1] = g; o[x * 4 + 2] = b; o[x * 4 + 3] = a;
         }
     }
-    std::vector<float> acc(size_t(dw) * 4);
+    });
     auto cl = [](float v) { return std::clamp(int(v + 0.5f), 0, 255); };
-    for (int y = 0; y < dh; ++y) {
+    parallelRows(dh, big, [&](int lo, int hi) {
+    std::vector<float> acc(size_t(dw) * 4);
+    for (int y = lo; y < hi; ++y) {
         std::fill(acc.begin(), acc.end(), 0.0f);
         for (const Tap& t : ty[y]) {
             const float* m = &mid[size_t(t.k) * dw * 4];
@@ -393,6 +438,7 @@ void smoothscaleInto(const Surface& s, const Rect& areaIn, Surface& d) {
         for (int x = 0; x < dw; ++x)
             out[x] = P_(cl(acc[x * 4]), cl(acc[x * 4 + 1]), cl(acc[x * 4 + 2]), da ? cl(acc[x * 4 + 3]) : 255);
     }
+    });
 }
 
 SurfacePtr smoothscale(const Surface& s, int w, int h) {
